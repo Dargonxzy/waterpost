@@ -1,0 +1,5 @@
+build/
+compare/
+_to_delete/
+.runner/
+__pycache__/

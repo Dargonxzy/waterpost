@@ -1,0 +1,108 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 24,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows",
+            "displayName": "Windows / VS2022：依赖取自 ai3dgs 已安装的 vcpkg 目录",
+            "description": "CUDA 12.8（与 ai3dgs 相同的 toolset 写法）；第三方库与 ai3d 共用库都从 ../ai3dgs/build/vs2022-cuda/vcpkg_installed/x64-windows 取（可用环境变量 AI3D_WATERPOST_PREFIX 覆盖）",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/windows",
+            "toolset": {
+                "value": "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8",
+                "strategy": "set"
+            },
+            "cacheVariables": {
+                "CMAKE_CUDA_COMPILER": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe",
+                "CUDAToolkit_ROOT": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8",
+                "CMAKE_PREFIX_PATH": "$penv{AI3D_WATERPOST_PREFIX};${sourceDir}/../ai3dgs/build/vs2022-cuda/vcpkg_installed/x64-windows",
+                "BUILD_TESTING": "ON",
+                "AI3D_WATERPOST_ENABLE_CUDA": "ON",
+                "AI3D_CUDA_ARCHITECTURES": "native"
+            }
+        },
+        {
+            "name": "windows-siblings",
+            "displayName": "Windows / VS2022：相邻目录 ai3d-core / ai3d-io 源码联调（并构建 point_pack_tool）",
+            "inherits": "windows",
+            "binaryDir": "${sourceDir}/build/windows-siblings",
+            "cacheVariables": {
+                "AI3D_WATERPOST_USE_SIBLINGS": "ON",
+                "AI3D_WATERPOST_BUILD_POINT_PACK_TOOL": "ON"
+            }
+        },
+        {
+            "name": "vcpkg",
+            "displayName": "vcpkg 清单模式（Ninja，Windows 从 VS 开发者命令行运行）",
+            "description": "ai3d-* 端口来自内网 registry（vcpkg-configuration.json）",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/vcpkg",
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_TESTING": "ON"
+            }
+        },
+        {
+            "name": "linux-siblings",
+            "displayName": "Linux：相邻目录源码联调",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/linux",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "AI3D_WATERPOST_USE_SIBLINGS": "ON",
+                "BUILD_TESTING": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows",
+            "configurePreset": "windows",
+            "configuration": "Release"
+        },
+        {
+            "name": "windows-siblings",
+            "configurePreset": "windows-siblings",
+            "configuration": "Release"
+        },
+        {
+            "name": "vcpkg",
+            "configurePreset": "vcpkg"
+        },
+        {
+            "name": "linux-siblings",
+            "configurePreset": "linux-siblings"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "windows",
+            "configurePreset": "windows",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "windows-siblings",
+            "configurePreset": "windows-siblings",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "linux-siblings",
+            "configurePreset": "linux-siblings",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}
