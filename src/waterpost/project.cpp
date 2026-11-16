@@ -468,7 +468,7 @@ Config config_from_json(const Json& v)
     c.denoise = v.value("denoise", true);
     c.denoise_radius = v.contains("denoise_radius") ? jnum(v.at("denoise_radius")) : 0.5;
     c.denoise_min_points = v.value("denoise_min_points", 30);
-    c.denoise_method = v.value("denoise_method", std::string("sor"));
+    c.denoise_method = v.value("denoise_method", std::string("cluster"));
     c.denoise_k = v.value("denoise_k", 20);
     c.denoise_std_ratio = v.contains("denoise_std_ratio") ? jnum(v.at("denoise_std_ratio")) : 2.0;
     c.denoise_max_distance = v.contains("denoise_max_distance") ? jnum(v.at("denoise_max_distance")) : 2.0;

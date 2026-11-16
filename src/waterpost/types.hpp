@@ -112,9 +112,9 @@ struct Config
     double carve_float_geometry_water = 0.2;
 
     // 通用漂浮物去噪：中心距离 <= denoise_radius 的高斯连成簇，少于 denoise_min_points 的小簇删除。
-    // 方法：sor（统计离群点，默认）、radius（半径离群点）、cluster（欧氏聚类小簇）。
+    // 方法：cluster（欧氏聚类小簇，默认）、sor（统计离群点）、radius（半径离群点）。
     bool denoise = true;
-    std::string denoise_method = "sor";
+    std::string denoise_method = "cluster";
     int denoise_k = 20;                 // sor：近邻数
     double denoise_std_ratio = 2.0;     // sor：均值 + std_ratio * 标准差
     double denoise_max_distance = 2.0;  // sor：近邻搜索的最大距离
