@@ -235,6 +235,11 @@ Domain load_domain(const std::filesystem::path& project)
     {
         path = project / "BoundingBox.json";
     }
+    return load_domain_files(path, project / "roi.json");
+}
+
+Domain load_domain_files(const std::filesystem::path& path, const std::filesystem::path& roi)
+{
     const Json value = read_json_file(path);
     const Json& box = value.at("CurrentBoundingBox");
     Domain domain;
@@ -245,8 +250,7 @@ Domain load_domain(const std::filesystem::path& project)
         domain.upper[k] = jnum(box.at("max").at(axes[k]));
     }
     // ROI：投影坐标经 Normalizer（只支持无旋转）换到本地坐标。
-    const std::filesystem::path roi = project / "roi.json";
-    if (std::filesystem::is_regular_file(roi) && value.contains("Normalizer"))
+    if (!roi.empty() && std::filesystem::is_regular_file(roi) && value.contains("Normalizer"))
     {
         const Json r = read_json_file(roi);
         if (r.contains("projected") && r["projected"].contains("points") && r["projected"]["points"].size() >= 3)
@@ -411,6 +415,11 @@ Json config_to_json(const Config& c)
     v["work"] = path_utf8(c.work);
     v["output"] = path_utf8(c.output);
     v["mode"] = c.mode;
+    v["poses"] = path_utf8(c.poses);
+    v["bbox"] = path_utf8(c.bbox);
+    v["roi"] = path_utf8(c.roi);
+    v["view_margin"] = c.view_margin;
+    v["min_view_leaves"] = c.min_view_leaves;
     v["water_class"] = c.water_class;
     v["cell_size"] = c.cell_size;
     v["spacing"] = c.spacing;
@@ -448,6 +457,11 @@ Config config_from_json(const Json& v)
     c.work = utf8_path(v.at("work").get<std::string>());
     c.output = utf8_path(v.value("output", std::string()));
     c.mode = v.value("mode", std::string("blocks"));
+    c.poses = utf8_path(v.value("poses", std::string()));
+    c.bbox = utf8_path(v.value("bbox", std::string()));
+    c.roi = utf8_path(v.value("roi", std::string()));
+    c.view_margin = v.contains("view_margin") ? jnum(v.at("view_margin")) : 0.5;
+    c.min_view_leaves = v.value("min_view_leaves", 1);
     c.water_class = v.at("water_class").get<int>();
     c.cell_size = jnum(v.at("cell_size"));
     c.spacing = jnum(v.at("spacing"));
@@ -487,7 +501,7 @@ Config load_config(const std::filesystem::path& work)
     const std::filesystem::path path = work / "config.json";
     if (!std::filesystem::is_regular_file(path))
     {
-        fail_missing("Missing work/config.json; run detect first: " + path_utf8(path));
+        fail_missing("Missing work/config.json; run assign (or all) first: " + path_utf8(path));
     }
     Config config = config_from_json(read_json_file(path));
     config.work = work;

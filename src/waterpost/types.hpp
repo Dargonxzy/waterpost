@@ -88,7 +88,12 @@ struct Config
     std::filesystem::path mask_dir;
     std::filesystem::path work;
     std::filesystem::path output;
-    std::string mode = "blocks";
+    std::string mode = "blocks";        // blocks（有分块成果）| poses（LOD + 位姿 JSON + 掩码）
+    std::filesystem::path poses;        // poses：位姿 JSON
+    std::filesystem::path bbox;         // poses：可选 bbox.json（工程范围与 ROI 的 Normalizer）
+    std::filesystem::path roi;          // poses：可选 roi.json（需要 bbox）
+    double view_margin = 0.5;           // poses：相机中心 XY 可在块范围外 view_margin * 块边长之内
+    int min_view_leaves = 1;            // poses：视图至少看到块的这么多个最细层叶节点才算该块的视图
     int water_class = 9;
     double cell_size = 1.0;
     double spacing = 1.6;

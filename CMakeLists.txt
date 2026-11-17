@@ -3,7 +3,7 @@ if(POLICY CMP0144)
     cmake_policy(SET CMP0144 NEW)
 endif()
 
-# 水域后处理（blockgs/water_postprocessing 精细层流程）的 C++ / CUDA 版：输入 BIN LOD + 语义掩码 + 分块相机，
+# 水域后处理（blockgs/water_postprocessing 精细层流程）的 C++ / CUDA 版：输入 BIN LOD + 语义掩码 + 分块相机（或位姿 JSON），
 # 输出补水后的 LOD。基础能力来自 ai3d 共用库：错误类型（ai3d-core）、COLMAP 读取（ai3d-io）、CUDA 编译设置（ai3d-gpu）。
 project(ai3d_waterpost VERSION 0.1.0 LANGUAGES CXX CUDA)
 
@@ -76,6 +76,7 @@ add_library(ai3d_waterpost_lib STATIC
     src/waterpost/parallel.cpp
     src/waterpost/project.cpp
     src/waterpost/reconcile.cpp
+    src/waterpost/scene.cpp
 )
 ai3d_waterpost_compile_settings(ai3d_waterpost_lib)
 target_include_directories(ai3d_waterpost_lib

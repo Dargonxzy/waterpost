@@ -8,6 +8,7 @@
 #include "masks.hpp"
 #include "parallel.hpp"
 #include "project.hpp"
+#include "scene.hpp"
 #include "timer.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -61,15 +62,26 @@ struct Sum
 
 void run_evaluate(const std::filesystem::path& project, const std::vector<std::pair<std::string, std::filesystem::path>>& variants,
                   const std::filesystem::path& mask_dir, const std::filesystem::path& images, int step,
-                  const std::filesystem::path& csv, int gpu, int water_class, const std::vector<std::string>& only)
+                  const std::filesystem::path& csv, int gpu, int water_class, const std::vector<std::string>& only,
+                  const std::filesystem::path& poses)
 {
     gpu_select_device(gpu);
     std::map<std::string, View> unique;
-    for (const std::string& name : project_blocks(project))
+    if (!poses.empty())
     {
-        for (View& view : block_views(project, name, mask_dir))
+        for (View& view : read_pose_views(poses, mask_dir))
         {
             unique.emplace(view.key(), std::move(view));
+        }
+    }
+    else
+    {
+        for (const std::string& name : project_blocks(project))
+        {
+            for (View& view : block_views(project, name, mask_dir))
+            {
+                unique.emplace(view.key(), std::move(view));
+            }
         }
     }
     std::vector<View> views;

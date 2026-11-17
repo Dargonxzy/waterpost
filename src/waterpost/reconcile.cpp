@@ -6,6 +6,7 @@
 #include "lod.hpp"
 #include "npz_util.hpp"
 #include "project.hpp"
+#include "scene.hpp"
 #include "stages.hpp"
 #include "timer.hpp"
 
@@ -264,8 +265,13 @@ void run_reconcile(const Config& config)
         p.obs_anchor = npz_get<std::int64_t>(reader, "obs_anchor");
         if (!p.metadata.at("view_keys").empty())
         {
-            // 视图目录：直接读块的相机（与 detect 用的是同一份 sparse/0）。
-            for (const View& view : block_views(config.project, name, config.mask_dir))
+            // 视图目录：有水块在 detect 里用的视图（work/scene）。
+            const SceneBlock* scene_block = load_scene(config).block(name);
+            if (!scene_block)
+            {
+                fail_value("Block is not present in work/scene: " + name);
+            }
+            for (const View& view : scene_views(config, scene_block->view_keys))
             {
                 catalog.emplace(view.mask_key, view_record(view));
             }
@@ -446,7 +452,7 @@ void run_reconcile(const Config& config)
     }
 
     // 块范围、全局格网与每块的岸线分片。
-    Domain domain = load_domain(config.project);
+    Domain domain = load_scene(config).domain;
     {
         // 瓦片范围：LOD 中每块最细层叶节点的 XY 外包框。
         const LodIndex lod = read_lod_index(config.lod);

@@ -46,6 +46,8 @@ struct Domain
     static Domain from_json(const Json& value);
 };
 Domain load_domain(const std::filesystem::path& project);
+// 显式文件：bbox（bbox.json 格式，含 CurrentBoundingBox 与 Normalizer）与可选 roi.json（空路径 = 无 ROI）。
+Domain load_domain_files(const std::filesystem::path& bbox, const std::filesystem::path& roi);
 
 Json view_record(const View& view);
 View view_from_record(const Json& record);

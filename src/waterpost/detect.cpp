@@ -9,6 +9,7 @@
 #include "npz_util.hpp"
 #include "parallel.hpp"
 #include "project.hpp"
+#include "scene.hpp"
 #include "stages.hpp"
 #include "timer.hpp"
 
@@ -363,21 +364,39 @@ void run_detect(const Config& config, const std::string& name)
     {
         fail_value("Block is not present in the LOD: " + name);
     }
-    std::vector<View> views = block_views(config.project, name, config.mask_dir);
+    const SceneBlock* scene_block = load_scene(config).block(name);
+    if (!scene_block)
+    {
+        fail_value("Block is not present in work/scene: " + name);
+    }
+    std::vector<View> views = scene_views(config, scene_block->view_keys);
     require_pinhole(views);
     MaskCache cache(config.water_class, std::size_t{1} << 30);
     const VotePolicy policy;
 
-    // 1) 每张图解码一次：占据格网（ROI 预检 + apply 反票）。
+    // 1) 占据格网（ROI 预检 + apply 反票）：有 work/scene 时 assign 已经对每张图解码过一次；
+    //    blocks 模式直接从 detect 开始时，在这里每张图解码一次。
     Timer timer;
+    const bool shared_occupancy = has_scene(config);
     std::vector<Occupancy> occupancy(views.size());
-    parallel_for_limited(views.size(), 8, [&](std::size_t i) { occupancy[i] = cache.occupancy(views[i]); });
+    if (shared_occupancy)
+    {
+        const auto& all = scene_occupancy(config);
+        for (std::size_t i = 0; i < views.size(); ++i)
+        {
+            occupancy[i] = all.at(views[i].mask_key);
+        }
+    }
+    else
+    {
+        parallel_for_limited(views.size(), 8, [&](std::size_t i) { occupancy[i] = cache.occupancy(views[i]); });
+    }
     const double decode_seconds = timer.seconds();
 
     timer = Timer();
     Gaussians g = read_block_gaussians(lod, *block, nullptr);
     const double read_seconds = timer.seconds();
-    log("[DETECT] %s: %zu finest Gaussians in %zu leaves (L%d), %zu views, masks %.1fs, LOD %.1fs", name.c_str(),
+    log("[DETECT] %s: %zu finest Gaussians in %zu leaves (L%d), %zu views, occupancy %.1fs, LOD %.1fs", name.c_str(),
         g.count, block->leaves.size(), block->level, views.size(), decode_seconds, read_seconds);
 
     // 2) ROI 预检：有水且 ROI 碰到水格的视图需要像素级投票，其余只记反票。
@@ -413,7 +432,7 @@ void run_detect(const Config& config, const std::string& name)
     stats["count"] = g.count;
     stats["views"] = views.size();
     stats["selected_views"] = selected_count;
-    stats["mask_decode_seconds"] = decode_seconds;
+    stats["occupancy_seconds"] = decode_seconds;
     stats["lod_read_seconds"] = read_seconds;
 
     const std::size_t n = g.count;
@@ -706,31 +725,34 @@ void run_detect(const Config& config, const std::string& name)
         npz_put(land_grid, "land_zmax", zmax);
         npz_put(land_grid, "land_count", counts);
         land_grid.write(out / "land_grid.npz", true);
-        // 占据格网（apply 的反票，不再解码 PNG）。
-        NpzWriter occ;
-        std::vector<std::uint8_t> blob;
-        std::vector<std::int64_t> offsets, bytes, water_pixels;
-        std::vector<std::int32_t> rows, cols;
-        for (std::size_t r = 0; r < order.size(); ++r)
+        if (!shared_occupancy)
         {
-            const Occupancy& o = occupancy[order[r]];
-            offsets.push_back(static_cast<std::int64_t>(blob.size()));
-            bytes.push_back(static_cast<std::int64_t>(o.packed.size()));
-            blob.insert(blob.end(), o.packed.begin(), o.packed.end());
-            rows.push_back(o.rows);
-            cols.push_back(o.cols);
-            water_pixels.push_back(o.water_pixels);
+            // 没有 work/scene：占据格网存在本块（candidates 的反票），顺序同 view_keys。
+            NpzWriter occ;
+            std::vector<std::uint8_t> blob;
+            std::vector<std::int64_t> offsets, bytes, water_pixels;
+            std::vector<std::int32_t> rows, cols;
+            for (std::size_t r = 0; r < order.size(); ++r)
+            {
+                const Occupancy& o = occupancy[order[r]];
+                offsets.push_back(static_cast<std::int64_t>(blob.size()));
+                bytes.push_back(static_cast<std::int64_t>(o.packed.size()));
+                blob.insert(blob.end(), o.packed.begin(), o.packed.end());
+                rows.push_back(o.rows);
+                cols.push_back(o.cols);
+                water_pixels.push_back(o.water_pixels);
+            }
+            npz_put(occ, "occupancy_blob", blob);
+            npz_put(occ, "occupancy_offsets", offsets);
+            npz_put(occ, "occupancy_bytes", bytes);
+            npz_put(occ, "occupancy_rows", rows);
+            npz_put(occ, "occupancy_cols", cols);
+            npz_put(occ, "occupancy_water_pixels", water_pixels);
+            occ.write(out / "occupancy.npz", true);
         }
-        npz_put(occ, "occupancy_blob", blob);
-        npz_put(occ, "occupancy_offsets", offsets);
-        npz_put(occ, "occupancy_bytes", bytes);
-        npz_put(occ, "occupancy_rows", rows);
-        npz_put(occ, "occupancy_cols", cols);
-        npz_put(occ, "occupancy_water_pixels", water_pixels);
-        occ.write(out / "occupancy.npz", true);
     }
 
-    // 交接元数据：视图只存掩码键（obs_view 与占据格网按此顺序），相机由 reconcile 统一建目录。
+    // 交接元数据：视图只存掩码键（obs_view 与本块占据格网按此顺序），相机在 work/scene（或 artifacts/blocks）。
     Json metadata;
     metadata["schema"] = "ai3d-waterpost.prepared/2";
     metadata["block"] = name;
@@ -738,7 +760,7 @@ void run_detect(const Config& config, const std::string& name)
     metadata["water"] = seed_rows.size();
     metadata["deletion_candidates"] = water_rows.size();
     metadata["shore"] = shore.size();
-    metadata["bounds"] = box_json(block_core_bounds(config.project, name));
+    metadata["bounds"] = box_json(scene_block->bounds);
     metadata["no_water"] = no_water;
     Json keys = Json::array();
     if (!no_water)

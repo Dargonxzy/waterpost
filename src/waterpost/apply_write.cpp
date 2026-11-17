@@ -7,6 +7,7 @@
 #include "lod.hpp"
 #include "npz_util.hpp"
 #include "parallel.hpp"
+#include "scene.hpp"
 #include "stages.hpp"
 #include "timer.hpp"
 
@@ -831,22 +832,10 @@ std::vector<std::int64_t> denoise_floaters(const Gaussians& g, const std::vector
 
 std::vector<std::string> pipeline_blocks(const Config& config)
 {
-    const LodIndex lod = read_lod_index(config.lod);
     std::vector<std::string> result;
-    for (const std::string& name : project_blocks(config.project))
+    for (const SceneBlock& block : load_scene(config).blocks)
     {
-        if (lod.block(name))
-        {
-            result.push_back(name);
-        }
-        else
-        {
-            log("[BLOCKS] %s has no contents in the LOD; skipped", name.c_str());
-        }
-    }
-    if (result.empty())
-    {
-        fail_value("No project block is present in the LOD");
+        result.push_back(block.name);
     }
     return result;
 }

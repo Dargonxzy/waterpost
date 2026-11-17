@@ -1,14 +1,17 @@
 // 命令行入口：ai3d_waterpost <阶段> [选项]
 //
-// 阶段：all | detect | reconcile | candidates | active | samples | model | write | finalize
+// 阶段：all | split | assign | scene | detect | reconcile | candidates | active | samples | model | write | finalize
+//   按图像清单（可分机，split 写清单，assign --list 选清单）：assign
 //   每块（可分机，--tile-name 选块）：detect / candidates / samples / write
-//   全局（单机）：reconcile / active / model / finalize
-// mode：blocks（有分块成果：块的相机与范围来自 artifacts/blocks，高斯来自 LOD 最细层）。
+//   全局（单机）：split / scene / reconcile / active / model / finalize
+// mode：blocks（有分块成果：块的相机与范围来自 artifacts/blocks，高斯来自 LOD 最细层）；
+//       poses（没有分块成果：LOD + 位姿 JSON + 掩码，块取 LOD 中的块，每块的视图由 assign 按可见性确定）。
 
 #include "error.hpp"
 #include "fs_util.hpp"
 #include "parallel.hpp"
 #include "project.hpp"
+#include "scene.hpp"
 #include "stages.hpp"
 #include "timer.hpp"
 
@@ -59,13 +62,20 @@ std::vector<std::string> arguments(int argc, char** argv)
 
 const char* HELP =
     "usage: ai3d_waterpost <stage> --work DIR [options]\n"
-    "stages: all detect reconcile candidates active samples model write finalize\n"
-    "  --project DIR        task directory (artifacts/blocks, bbox.json); required for detect/all\n"
+    "stages: all split assign scene detect reconcile candidates active samples model write finalize\n"
+    "  --mode blocks|poses  blocks: cameras/blocks from <project>/artifacts/blocks; poses: LOD + --poses JSON\n"
+    "  --project DIR        task directory (artifacts/blocks, bbox.json); required in blocks mode\n"
+    "  --poses FILE         camera pose JSON (poses mode)\n"
+    "  --bbox FILE --roi FILE  fill domain in poses mode (default: LOD extent, no ROI)\n"
+    "  --view-margin X      poses: camera XY may lie X * block size outside the block (default 0.5)\n"
+    "  --min-view-leaves N  poses: a view belongs to a block if it sees >= N finest leaves (default 1)\n"
+    "  --parts N            split: write N image lists to work/assign/lists/part_XX.list\n"
+    "  --split interleave|contiguous  split: image k goes to list k mod N (default) or contiguous runs\n"
+    "  --list FILE          assign: process only the images in FILE (one name per line; default: all)\n"
     "  --lod DIR            input BIN LOD (default <project>/results/3dgs/lod/bin)\n"
     "  --mask-dir DIR       semantic masks (default <project>/.temp/semantic/masks)\n"
     "  --output DIR         output LOD directory (required before write/finalize)\n"
     "  --work DIR           intermediate files shared by all stages\n"
-    "  --mode blocks        processing mode (only 'blocks' is implemented)\n"
     "  --tile-name NAME     restrict a per-block stage to this block (repeatable)\n"
     "  --threads N --gpu-id N --debug --link-output --water-class N\n"
     "  --cell-size X --spacing X --footprint-spacing X\n"
@@ -94,7 +104,7 @@ int main(int argc, char** argv)
         // evaluate --project P --images DIR [--mask-dir M] --out CSV [--step N] --variant name=LOD ...
         try
         {
-            std::filesystem::path project, images, masks, csv;
+            std::filesystem::path project, images, masks, csv, poses;
             int step = 10, gpu = 0, water_class = 9;
             std::vector<std::pair<std::string, std::filesystem::path>> variants;
             std::vector<std::string> only;
@@ -105,6 +115,7 @@ int main(int argc, char** argv)
                 if (key == "--project") project = utf8_path(value);
                 else if (key == "--images") images = utf8_path(value);
                 else if (key == "--mask-dir") masks = utf8_path(value);
+                else if (key == "--poses") poses = utf8_path(value);
                 else if (key == "--out") csv = utf8_path(value);
                 else if (key == "--step") step = std::stoi(value);
                 else if (key == "--gpu-id") gpu = std::stoi(value);
@@ -128,7 +139,7 @@ int main(int argc, char** argv)
             }
             if (masks.empty()) masks = project / ".temp" / "semantic" / "masks";
             if (images.empty()) images = project / ".temp" / "undistortion" / "images";
-            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only);
+            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only, poses);
             return 0;
         }
         catch (const std::exception& error)
@@ -137,7 +148,8 @@ int main(int argc, char** argv)
             return 1;
         }
     }
-    const std::set<std::string> stages = {"all", "detect", "reconcile", "candidates", "active", "samples", "model", "write", "finalize"};
+    const std::set<std::string> stages = {"all",    "split",   "assign", "scene", "detect",  "reconcile",
+                                          "candidates", "active", "samples", "model", "write", "finalize"};
     if (!stages.count(stage))
     {
         std::fprintf(stderr, "%sunknown stage: %s\n", HELP, stage.c_str());
@@ -147,8 +159,8 @@ int main(int argc, char** argv)
     {
         Config config;
         std::vector<std::string> tiles;
-        std::string project, lod, masks, work, output, mode;
-        int threads = -1, gpu = -1;
+        std::string project, lod, masks, work, output, mode, poses, bbox, roi, list, split = "interleave";
+        int threads = -1, gpu = -1, parts = 0;
         bool debug = false, link = false;
         std::vector<std::pair<std::string, std::string>> overrides;
         for (std::size_t i = 1; i < args.size(); ++i)
@@ -167,6 +179,12 @@ int main(int argc, char** argv)
             else if (key == "--work") work = value();
             else if (key == "--output") output = value();
             else if (key == "--mode") mode = value();
+            else if (key == "--poses") poses = value();
+            else if (key == "--bbox") bbox = value();
+            else if (key == "--roi") roi = value();
+            else if (key == "--list") list = value();
+            else if (key == "--parts") parts = std::stoi(value());
+            else if (key == "--split") split = value();
             else if (key == "--tile-name") tiles.push_back(value());
             else if (key == "--threads") threads = std::stoi(value());
             else if (key == "--gpu-id") gpu = std::stoi(value());
@@ -193,14 +211,28 @@ int main(int argc, char** argv)
             fail_value("--work is required");
         }
         const std::filesystem::path work_dir = std::filesystem::absolute(utf8_path(work));
-        const bool fresh = stage == "all" || stage == "detect";
+        // 第一次运行时建 config.json：all / split / assign，以及 blocks 模式直接从 detect 开始（不跑 split / assign / scene）。
+        const bool fresh = stage == "all" || stage == "split" || stage == "assign" ||
+                           (stage == "detect" && (mode.empty() || mode == "blocks"));
         if (fresh && !std::filesystem::is_regular_file(work_dir / "config.json"))
         {
-            if (project.empty())
+            config.mode = mode.empty() ? "blocks" : mode;
+            if (!project.empty())
             {
-                fail_value("--project is required for the first detect/all run");
+                config.project = std::filesystem::absolute(utf8_path(project));
             }
-            config.project = std::filesystem::absolute(utf8_path(project));
+            if (config.mode == "blocks" && project.empty())
+            {
+                fail_value("--project is required for the first run in blocks mode");
+            }
+            if (config.mode == "poses" && poses.empty())
+            {
+                fail_value("--poses is required for the first split/assign/all run in poses mode");
+            }
+            if (project.empty() && (lod.empty() || masks.empty()))
+            {
+                fail_value("--lod and --mask-dir are required without --project");
+            }
             config.lod = lod.empty() ? config.project / "results" / "3dgs" / "lod" / "bin" : std::filesystem::absolute(utf8_path(lod));
             config.mask_dir = masks.empty() ? config.project / ".temp" / "semantic" / "masks" : std::filesystem::absolute(utf8_path(masks));
             config.work = work_dir;
@@ -209,6 +241,9 @@ int main(int argc, char** argv)
         {
             config = load_config(work_dir);
         }
+        if (!poses.empty()) config.poses = std::filesystem::absolute(utf8_path(poses));
+        if (!bbox.empty()) config.bbox = std::filesystem::absolute(utf8_path(bbox));
+        if (!roi.empty()) config.roi = std::filesystem::absolute(utf8_path(roi));
         if (!output.empty())
         {
             config.output = std::filesystem::absolute(utf8_path(output));
@@ -255,17 +290,17 @@ int main(int argc, char** argv)
             else if (name == "denoise_std_ratio") config.denoise_std_ratio = v;
             else if (name == "denoise_max_distance") config.denoise_max_distance = v;
             else if (name == "denoise_min_neighbors") config.denoise_min_neighbors = static_cast<int>(v);
+            else if (name == "view_margin") config.view_margin = v;
+            else if (name == "min_view_leaves") config.min_view_leaves = static_cast<int>(v);
             else fail_value("Unknown option --" + name);
         }
-        if (config.mode != "blocks")
+        if (config.mode != "blocks" && config.mode != "poses")
         {
-            fail_value("Mode '" + config.mode + "' is not implemented yet; use --mode blocks");
+            fail_value("Unknown mode '" + config.mode + "'; use --mode blocks or --mode poses");
         }
         set_thread_count(config.threads);
         save_config(config);
         const Timer total;
-        const std::vector<std::string> all_blocks = pipeline_blocks(config);
-        const std::vector<std::string> blocks = tiles.empty() ? all_blocks : tiles;
         auto needs_output = [&]() {
             if (config.output.empty())
             {
@@ -273,6 +308,8 @@ int main(int argc, char** argv)
             }
         };
         auto per_block = [&](void (*function)(const Config&, const std::string&), const char* label) {
+            // 块清单来自 work/scene（scene 阶段之后才有）。
+            const std::vector<std::string> blocks = tiles.empty() ? pipeline_blocks(config) : tiles;
             for (const std::string& block : blocks)
             {
                 const Timer timer;
@@ -283,6 +320,9 @@ int main(int argc, char** argv)
         if (stage == "all")
         {
             needs_output();
+            clear_assign_results(config);
+            run_assign(config, {});
+            run_scene(config);
             per_block(run_detect, "detect");
             run_reconcile(config);
             per_block(run_candidates, "candidates");
@@ -292,6 +332,14 @@ int main(int argc, char** argv)
             per_block(run_write, "write");
             run_finalize(config);
         }
+        else if (stage == "split")
+        {
+            if (parts < 1) fail_value("split needs --parts N");
+            if (split != "interleave" && split != "contiguous") fail_value("--split must be interleave or contiguous");
+            run_split(config, parts, split == "interleave");
+        }
+        else if (stage == "assign") run_assign(config, list.empty() ? std::filesystem::path() : std::filesystem::absolute(utf8_path(list)));
+        else if (stage == "scene") run_scene(config);
         else if (stage == "detect") per_block(run_detect, "detect");
         else if (stage == "reconcile") run_reconcile(config);
         else if (stage == "candidates") per_block(run_candidates, "candidates");

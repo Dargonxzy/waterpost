@@ -3,6 +3,7 @@
 #include "error.hpp"
 #include "fs_util.hpp"
 #include "npz_util.hpp"
+#include "scene.hpp"
 
 namespace ai3d::waterpost
 {
@@ -101,33 +102,58 @@ std::vector<double> load_seed_xyz(const Config& config, const std::string& block
 
 void load_occupancy(const Config& config, const std::string& block, std::unordered_map<std::string, Occupancy>& out)
 {
-    const std::filesystem::path dir = detect_dir(config, block);
-    if (!std::filesystem::is_regular_file(dir / "occupancy.npz"))
+    // 有水块在 detect 里用过的视图（components.json 的 view_keys）；占据格网来自 work/scene，没有 scene 时来自本块 detect。
+    const std::filesystem::path path = detect_dir(config, block) / "components.json";
+    if (!std::filesystem::is_regular_file(path))
     {
         return;
     }
-    const Json metadata = read_json_file(dir / "components.json");
-    const NpzReader reader(dir / "occupancy.npz");
-    const std::vector<std::uint8_t> blob = npz_get<std::uint8_t>(reader, "occupancy_blob");
-    const std::vector<std::int64_t> offsets = npz_get<std::int64_t>(reader, "occupancy_offsets");
-    const std::vector<std::int64_t> bytes = npz_get<std::int64_t>(reader, "occupancy_bytes");
-    const std::vector<std::int32_t> rows = npz_get<std::int32_t>(reader, "occupancy_rows");
-    const std::vector<std::int32_t> cols = npz_get<std::int32_t>(reader, "occupancy_cols");
-    const std::vector<std::int64_t> water = npz_get<std::int64_t>(reader, "occupancy_water_pixels");
-    const Json& keys = metadata.at("view_keys");
-    for (std::size_t i = 0; i < keys.size(); ++i)
+    const Json metadata = read_json_file(path);
+    if (metadata.value("no_water", false))
     {
-        const std::string key = keys[i].get<std::string>();
+        return;
+    }
+    if (!has_scene(config))
+    {
+        // blocks 模式直接从 detect 开始：占据格网在 detect/<块>/occupancy.npz（顺序同 view_keys）。
+        const NpzReader reader(detect_dir(config, block) / "occupancy.npz");
+        const std::vector<std::uint8_t> blob = npz_get<std::uint8_t>(reader, "occupancy_blob");
+        const std::vector<std::int64_t> offsets = npz_get<std::int64_t>(reader, "occupancy_offsets");
+        const std::vector<std::int64_t> bytes = npz_get<std::int64_t>(reader, "occupancy_bytes");
+        const std::vector<std::int32_t> rows = npz_get<std::int32_t>(reader, "occupancy_rows");
+        const std::vector<std::int32_t> cols = npz_get<std::int32_t>(reader, "occupancy_cols");
+        const std::vector<std::int64_t> water = npz_get<std::int64_t>(reader, "occupancy_water_pixels");
+        const Json& keys = metadata.at("view_keys");
+        for (std::size_t i = 0; i < keys.size(); ++i)
+        {
+            const std::string key = keys[i].get<std::string>();
+            if (out.count(key))
+            {
+                continue;
+            }
+            Occupancy o;
+            o.rows = rows[i];
+            o.cols = cols[i];
+            o.water_pixels = water[i];
+            o.packed.assign(blob.begin() + offsets[i], blob.begin() + offsets[i] + bytes[i]);
+            out.emplace(key, std::move(o));
+        }
+        return;
+    }
+    const std::unordered_map<std::string, Occupancy>& all = scene_occupancy(config);
+    for (const Json& item : metadata.at("view_keys"))
+    {
+        const std::string key = item.get<std::string>();
         if (out.count(key))
         {
             continue;
         }
-        Occupancy o;
-        o.rows = rows[i];
-        o.cols = cols[i];
-        o.water_pixels = water[i];
-        o.packed.assign(blob.begin() + offsets[i], blob.begin() + offsets[i] + bytes[i]);
-        out.emplace(key, std::move(o));
+        const auto found = all.find(key);
+        if (found == all.end())
+        {
+            fail_value("View of block " + block + " is not in work/scene: " + key);
+        }
+        out.emplace(key, found->second);
     }
 }
 
