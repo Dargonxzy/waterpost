@@ -7,6 +7,7 @@
 #include "npz_util.hpp"
 #include "project.hpp"
 #include "scene.hpp"
+#include "shore.hpp"
 #include "stages.hpp"
 #include "timer.hpp"
 
@@ -23,39 +24,34 @@ namespace ai3d::waterpost
 namespace
 {
 
-struct ShoreLevel
-{
-    double height = 0;
-    std::vector<std::uint8_t> inliers;
-};
+} // namespace
 
-ShoreLevel shore_level(const std::vector<double>& z, double tolerance = .6)
+ShoreLevel shore_level(const std::vector<double>& z, double tolerance)
 {
     const double med = median(z);
-    std::vector<double> candidates;
-    for (double value : z)
-    {
-        if (value <= med)
-        {
-            candidates.push_back(value);
-        }
-    }
-    std::vector<std::size_t> scores(candidates.size(), 0);
+    const double half = tolerance / 2;
+    std::vector<double> sorted = z;
+    std::sort(sorted.begin(), sorted.end());
+    // 候选 = 不高于中位数的高度（升序）；分数 = |value - c| <= half 的个数。浮点下 |value - c| 随 value 远离 c 单调
+    // 不减，所以满足条件的是排序数组里的一段，两端用与逐点比较完全相同的表达式二分查找。
     std::size_t best_score = 0;
-    for (std::size_t c = 0; c < candidates.size(); ++c)
-    {
-        for (double value : z)
-        {
-            scores[c] += std::abs(value - candidates[c]) <= tolerance / 2 ? 1 : 0;
-        }
-        best_score = std::max(best_score, scores[c]);
-    }
     double center = std::numeric_limits<double>::infinity();
-    for (std::size_t c = 0; c < candidates.size(); ++c)
+    for (std::size_t k = 0; k < sorted.size() && sorted[k] <= med; ++k)
     {
-        if (scores[c] == best_score)
+        const double c = sorted[k];
+        if (k > 0 && sorted[k - 1] == c)
         {
-            center = std::min(center, candidates[c]);
+            continue;
+        }
+        const auto first = std::partition_point(sorted.begin(), sorted.end(),
+                                                [&](double value) { return value < c && std::abs(value - c) > half; });
+        const auto last = std::partition_point(first, sorted.end(),
+                                               [&](double value) { return !(value > c && std::abs(value - c) > half); });
+        const std::size_t score = static_cast<std::size_t>(last - first);
+        if (score > best_score)
+        {
+            best_score = score;
+            center = c; // 候选升序：只有严格更大才替换，并列时保留最低的
         }
     }
     ShoreLevel result;
@@ -63,7 +59,7 @@ ShoreLevel shore_level(const std::vector<double>& z, double tolerance = .6)
     std::size_t count = 0;
     for (std::size_t i = 0; i < z.size(); ++i)
     {
-        result.inliers[i] = std::abs(z[i] - center) <= tolerance / 2;
+        result.inliers[i] = std::abs(z[i] - center) <= half;
         count += result.inliers[i];
     }
     if (count < 3)
@@ -94,6 +90,9 @@ ShoreLevel shore_level(const std::vector<double>& z, double tolerance = .6)
     }
     return result;
 }
+
+namespace
+{
 
 struct UnionFind
 {
@@ -392,21 +391,27 @@ void run_reconcile(const Config& config)
     Json surfaces = Json::array();
     Json skipped = Json::array();
     std::set<int> ids(shore_ids.begin(), shore_ids.end());
+    // 锚点按水体分组一次（O(锚点数)），不再对每个水体扫一遍全部锚点。
+    std::map<int, std::vector<std::size_t>> rows_of;
+    for (std::size_t a = 0; a < anchors; ++a)
+    {
+        if (shore_ids[a] > 0)
+        {
+            rows_of[shore_ids[a]].push_back(a);
+        }
+    }
     for (int wid : ids)
     {
         if (wid <= 0)
         {
             continue;
         }
-        std::vector<std::size_t> rows;
+        const std::vector<std::size_t>& rows = rows_of[wid];
         std::vector<double> z;
-        for (std::size_t a = 0; a < anchors; ++a)
+        z.reserve(rows.size());
+        for (std::size_t a : rows)
         {
-            if (shore_ids[a] == wid)
-            {
-                rows.push_back(a);
-                z.push_back(shore[3 * a + 2]);
-            }
+            z.push_back(shore[3 * a + 2]);
         }
         Json item;
         item["water_id"] = wid;

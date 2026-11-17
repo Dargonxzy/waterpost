@@ -269,6 +269,81 @@ std::vector<std::uint8_t> signature_image(MaskCache& cache, const View& view, co
     return image;
 }
 
+
+// Pass 1 的 CPU 预筛：把水位平面上的投票区域（矩形 lo-hi，z = lo[2]）投到视图里，外包矩形（外扩一个占据格）
+// 覆盖的占据格网里没有水格时，这张视图对任何格子都不会投出"可能正票"，可以不上 GPU。平面矩形投影是凸四边形，
+// 区域内每个格子的投影都在四个角点投影的外包矩形内；有角点在相机后方时不剪（返回 true）。
+bool occupancy_may_support(const View& view, const Occupancy& occupancy, const Vec3& lo, const Vec3& hi)
+{
+    double umin = 1e300, umax = -1e300, vmin = 1e300, vmax = -1e300;
+    for (int c = 0; c < 4; ++c)
+    {
+        const double p[3] = {(c & 1) ? hi[0] : lo[0], (c & 2) ? hi[1] : lo[1], lo[2]};
+        double u = 0, v = 0;
+        if (!project_point(view, p, u, v))
+        {
+            return true;
+        }
+        umin = std::min(umin, u);
+        umax = std::max(umax, u);
+        vmin = std::min(vmin, v);
+        vmax = std::max(vmax, v);
+    }
+    // 近地平线时投影坐标可能极大：先夹住再转 int。
+    umin = std::clamp(umin, -1e7, 1e7);
+    umax = std::clamp(umax, -1e7, 1e7);
+    vmin = std::clamp(vmin, -1e7, 1e7);
+    vmax = std::clamp(vmax, -1e7, 1e7);
+    const int c0 = std::max(0, static_cast<int>(std::floor(umin / OCCUPANCY_CELL)) - 1);
+    const int c1 = std::min(occupancy.cols - 1, static_cast<int>(std::floor(umax / OCCUPANCY_CELL)) + 1);
+    const int r0 = std::max(0, static_cast<int>(std::floor(vmin / OCCUPANCY_CELL)) - 1);
+    const int r1 = std::min(occupancy.rows - 1, static_cast<int>(std::floor(vmax / OCCUPANCY_CELL)) + 1);
+    for (int r = r0; r <= r1; ++r)
+    {
+        for (int c = c0; c <= c1; ++c)
+        {
+            if (occupancy.at(r, c))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+// 精确复核的 CPU 预筛：精确票要求格子投到该水体分量的像素上，那必然是水像素，所在 32 像素格的占据位为 1。
+// 任何一个格子投影后（看所在占据格及其 3x3 邻域，吸收 CPU 双精度与 GPU 单精度投影的差别）都碰不到水格时，
+// 这张视图的精确票必然为 0，不必解码掩码、生成标签图。
+bool rows_may_hit_water(const View& view, const Occupancy& occupancy, const std::vector<double>& points)
+{
+    for (std::size_t k = 0; k < points.size() / 3; ++k)
+    {
+        double u = 0, v = 0;
+        if (!project_point(view, points.data() + 3 * k, u, v))
+        {
+            continue;
+        }
+        if (!(u > -2 && v > -2 && u < view.width + 2 && v < view.height + 2))
+        {
+            continue;
+        }
+        const int c = static_cast<int>(std::floor(u / OCCUPANCY_CELL)), r = static_cast<int>(std::floor(v / OCCUPANCY_CELL));
+        for (int dr = -1; dr <= 1; ++dr)
+        {
+            for (int dc = -1; dc <= 1; ++dc)
+            {
+                const int rr = r + dr, cc = c + dc;
+                if (rr >= 0 && cc >= 0 && rr < occupancy.rows && cc < occupancy.cols && occupancy.at(rr, cc))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 void run_candidates(const Config& config, const std::string& name)
@@ -334,7 +409,8 @@ void run_candidates(const Config& config, const std::string& name)
     {
         view_index[views[i].mask_key] = i;
     }
-    MaskCache cache(config.water_class, std::size_t{1} << 30);
+    MaskCache& cache = shared_mask_cache(config.water_class);
+    const std::size_t decodes_before = cache.decodes();
     if (has_region && !report.surfaces.empty())
     {
         gpu_select_device(config.gpu);
@@ -342,6 +418,8 @@ void run_candidates(const Config& config, const std::string& name)
     const std::int64_t origin_index[2] = {static_cast<std::int64_t>(std::nearbyint(grid.origin[0] / spacing)),
                                           static_cast<std::int64_t>(std::nearbyint(grid.origin[1] / spacing))};
 
+    std::size_t skipped_bodies = 0, culled_views = 0, total_sig_views = 0, exact_culled = 0, exact_total = 0;
+    double prof_pass1 = 0, prof_images = 0, prof_exact = 0;
     for (const Surface& surface : report.surfaces)
     {
         if (!has_region)
@@ -364,6 +442,30 @@ void run_candidates(const Config& config, const std::string& name)
         }
         if (empty)
         {
+            continue;
+        }
+        // 签名视图（看得到本块、且该水体在其中有分量的视图）：正票只来自它们，一张都没有就不可能有候选格，
+        // 整个水体直接跳过（不建屏障与参照格）。只查该水体签名里的视图，不扫全部视图。
+        const Vec3 patch_lo{grid.origin[0] + patch_low[0] * spacing, grid.origin[1] + patch_low[1] * spacing, height};
+        const Vec3 patch_hi{grid.origin[0] + (patch_high[0] - 1) * spacing, grid.origin[1] + (patch_high[1] - 1) * spacing, height};
+        std::vector<std::size_t> sig_views;
+        for (const auto& [key, labels] : surface.signature)
+        {
+            const auto found = view_index.find(key);
+            if (!labels.empty() && found != view_index.end() && view_sees_box(views[found->second], patch_lo, patch_hi, .25))
+            {
+                sig_views.push_back(found->second);
+            }
+        }
+        std::sort(sig_views.begin(), sig_views.end());
+        if (sig_views.empty())
+        {
+            Json skipped;
+            skipped["cells"] = 0;
+            skipped["bbox"] = nullptr;
+            skipped["skipped"] = "no_signature_view_sees_block";
+            bodies[std::to_string(wid)] = skipped;
+            ++skipped_bodies;
             continue;
         }
         const std::size_t count = static_cast<std::size_t>(ps[0] * ps[1]);
@@ -421,50 +523,43 @@ void run_candidates(const Config& config, const std::string& name)
 
         // Pass 1：可能的正票（签名视图，占据格网超集，再用精确标签收紧），不做遮挡。
         Json summary;
-        Vec3 patch_lo{grid.origin[0] + patch_low[0] * spacing, grid.origin[1] + patch_low[1] * spacing, height};
-        Vec3 patch_hi{grid.origin[0] + (patch_high[0] - 1) * spacing, grid.origin[1] + (patch_high[1] - 1) * spacing, height};
-        std::vector<std::size_t> seeing;
-        for (std::size_t i = 0; i < views.size(); ++i)
-        {
-            if (view_sees_box(views[i], patch_lo, patch_hi, .25))
-            {
-                seeing.push_back(i);
-            }
-        }
-        std::vector<std::size_t> sig_views;
-        for (std::size_t i : seeing)
-        {
-            const auto found = surface.signature.find(views[i].mask_key);
-            if (found != surface.signature.end() && !found->second.empty())
-            {
-                sig_views.push_back(i);
-            }
-        }
         std::vector<std::uint8_t> possible(count, 0);
         std::size_t possible_count = 0;
         double support_seconds = 0;
         {
             const Timer t;
-            if (!sig_views.empty())
+            // 先在 CPU 上剪掉对本块不可能投正票的视图（无水，或投票区域落不到水格上）；全部剪掉就不上 GPU。
+            std::vector<std::size_t> pass_views;
+            for (std::size_t i : sig_views)
+            {
+                const auto entry = occupancy.find(views[i].mask_key);
+                if (entry != occupancy.end() &&
+                    (entry->second.water_pixels == 0 || !occupancy_may_support(views[i], entry->second, patch_lo, patch_hi)))
+                {
+                    continue;
+                }
+                pass_views.push_back(i);
+            }
+            culled_views += sig_views.size() - pass_views.size();
+            total_sig_views += sig_views.size();
+            if (!pass_views.empty())
             {
                 std::vector<double> points(3 * count);
                 for (std::size_t r = 0; r < count; ++r)
                 {
                     cell_point(r, points.data() + 3 * r);
                 }
+                const Timer t_pass1;
                 GridGpu pass(points, {}, 4);
-                for (std::size_t i : sig_views)
+                for (std::size_t i : pass_views)
                 {
                     const auto entry = occupancy.find(views[i].mask_key);
-                    if (entry != occupancy.end() && entry->second.water_pixels == 0)
-                    {
-                        continue;
-                    }
                     pass.possible(pinhole(views[i]), entry == occupancy.end() ? nullptr : &entry->second);
                 }
                 std::vector<std::uint32_t> support, against;
                 std::size_t occluded = 0;
                 pass.download(support, against, occluded);
+                prof_pass1 += t_pass1.seconds();
                 std::vector<std::size_t> rows;
                 for (std::size_t r = 0; r < count; ++r)
                 {
@@ -487,29 +582,53 @@ void run_candidates(const Config& config, const std::string& name)
                         }
                     }
                     GridGpu exact(subset, {}, 4);
-                    std::vector<std::size_t> used;
+                    std::vector<std::size_t> near;
                     for (std::size_t i : sig_views)
                     {
                         if (view_sees_box(views[i], lo, hi, .25))
                         {
-                            used.push_back(i);
+                            near.push_back(i);
                         }
                     }
+                    std::vector<std::uint8_t> keep(near.size(), 1);
+                    parallel_for_each(near.size(), [&](std::size_t j) {
+                        const auto entry = occupancy.find(views[near[j]].mask_key);
+                        if (entry != occupancy.end() && !rows_may_hit_water(views[near[j]], entry->second, subset))
+                        {
+                            keep[j] = 0;
+                        }
+                    });
+                    std::vector<std::size_t> used;
+                    for (std::size_t j = 0; j < near.size(); ++j)
+                    {
+                        if (keep[j])
+                        {
+                            used.push_back(near[j]);
+                        }
+                    }
+                    exact_culled += near.size() - used.size();
+                    exact_total += near.size();
                     // 标签图在 CPU 上按批并行准备，GPU 逐张计票。
                     for (std::size_t start = 0; start < used.size(); start += 16)
                     {
                         const std::size_t end = std::min(used.size(), start + 16);
                         std::vector<std::vector<std::uint8_t>> images(end - start);
+                        const Timer t_images;
                         parallel_for_limited(end - start, 16, [&](std::size_t j) {
                             const View& view = views[used[start + j]];
                             images[j] = signature_image(cache, view, surface.signature.at(view.mask_key), true);
                         });
+                        prof_images += t_images.seconds();
+                        const Timer t_exact;
                         for (std::size_t j = 0; j < images.size(); ++j)
                         {
                             exact.exact(pinhole(views[used[start + j]]), images[j].data());
                         }
+                        prof_exact += t_exact.seconds();
                     }
+                    const Timer t_down;
                     exact.download(support, against, occluded);
+                    prof_exact += t_down.seconds();
                     for (std::size_t k = 0; k < rows.size(); ++k)
                     {
                         if (support[k])
@@ -731,7 +850,12 @@ void run_candidates(const Config& config, const std::string& name)
     metadata["bodies"] = bodies;
     metadata["seconds"] = total.seconds();
     write_json_atomic(out / "metadata.json", metadata, false);
-    log("[CANDIDATES] %s complete: %zu cells in %.1fs", name.c_str(), all_ids.size(), total.seconds());
+    log("[CANDIDATES] %s complete: %zu cells, %zu of %zu bodies skipped (no signature view sees the block), "
+        "views culled on the CPU: support pass %zu/%zu, exact pass %zu/%zu, %.1fs",
+        name.c_str(), all_ids.size(), skipped_bodies, report.surfaces.size(), culled_views, total_sig_views, exact_culled,
+        exact_total, total.seconds());
+    log("[CANDIDATES] %s support pass: occupancy votes %.2fs, label images %.2fs, exact votes %.2fs (decodes %zu)", name.c_str(),
+        prof_pass1, prof_images, prof_exact, cache.decodes() - decodes_before);
 }
 
 // ---------------------------------------------------------------- active

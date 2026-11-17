@@ -377,7 +377,8 @@ void run_detect(const Config& config, const std::string& name)
     }
     std::vector<View> views = scene_views(config, scene_block->view_keys);
     require_pinhole(views);
-    MaskCache cache(config.water_class, std::size_t{1} << 30);
+    MaskCache& cache = shared_mask_cache(config.water_class);
+    const std::size_t decodes_before = cache.decodes();
     const VotePolicy policy;
 
     // 1) 占据格网（ROI 预检 + apply 反票）：有 work/scene 时 assign 已经对每张图解码过一次；
@@ -777,7 +778,7 @@ void run_detect(const Config& config, const std::string& name)
         }
     }
     metadata["view_keys"] = keys;
-    stats["mask_decodes"] = cache.decodes();
+    stats["mask_decodes"] = cache.decodes() - decodes_before;
     stats["seconds"] = total.seconds();
     metadata["stats"] = stats;
     write_json_atomic(out / "components.json", metadata, false);

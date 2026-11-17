@@ -57,6 +57,9 @@ private:
     std::unordered_map<std::string, std::pair<Entry, std::list<std::string>::iterator>> m_entries;
 };
 
+// 进程内共享的掩码缓存（按水体类别区分，2 GiB 预算）：同一进程连续处理多块时，相邻块共用的视图只解码一次。
+MaskCache& shared_mask_cache(int water_class);
+
 // 外环宽度：hypot(w, h) * 0.0015 四舍五入，夹在 [2, 16]。
 int boundary_pixels(int width, int height);
 cv::Mat ellipse_kernel(int radius);

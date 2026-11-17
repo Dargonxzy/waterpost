@@ -734,11 +734,8 @@ void run_scene(const Config& config)
     }
     std::vector<Occupancy> occupancy(views.size());
     std::vector<int> owner(views.size(), -1);
-    std::vector<std::vector<std::int32_t>> visible(names.size());
-    for (auto& v : visible)
-    {
-        v.assign(views.size(), 0);
-    }
+    // 稀疏：每块只记看到它的视图（视图下标, 叶节点数），内存与"块数 × 视图数"无关。
+    std::vector<std::vector<std::pair<std::size_t, std::int32_t>>> visible(names.size());
     for (std::size_t s = 0; s < shard_names.size(); ++s)
     {
         const std::string& stem = shard_names[s];
@@ -784,7 +781,7 @@ void run_scene(const Config& config)
         }
         for (std::size_t r = 0; r < vis_view.size(); ++r)
         {
-            visible[static_cast<std::size_t>(vis_block[r])][global[static_cast<std::size_t>(vis_view[r])]] = vis_leaves[r];
+            visible[static_cast<std::size_t>(vis_block[r])].emplace_back(global[static_cast<std::size_t>(vis_view[r])], vis_leaves[r]);
         }
     }
     std::size_t missing = 0;
@@ -840,9 +837,10 @@ void run_scene(const Config& config)
         if (poses)
         {
             block.bounds = geometry[b].bounds;
-            for (std::size_t k = 0; k < views.size(); ++k)
+            std::sort(visible[b].begin(), visible[b].end());
+            for (const auto& [k, leaves] : visible[b])
             {
-                if (visible[b][k] >= std::max(1, config.min_view_leaves))
+                if (leaves >= std::max(1, config.min_view_leaves))
                 {
                     block.view_keys.push_back(views[k].mask_key);
                 }

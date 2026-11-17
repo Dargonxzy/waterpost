@@ -65,6 +65,16 @@ ai3d_waterpost.exe scene --work W
   相机也接受 `fx`/`fy`/`cx`/`cy` 字段；
 - 掩码默认 `<mask-dir>\<图像名换成 .png>`，也可以每张图给 `"mask"`（相对 `--mask-dir` 或绝对路径）；没有掩码的视图跳过。
 
+## 规模与性能
+
+- 同一进程连续处理多块（不带 `--tile-name` 或带多个 `--tile-name`、以及 `all`）时，detect / candidates 共享一个 2 GiB 的
+  掩码缓存，相邻块共用的视图只解码一次；分机时每台机器多分几块相邻的块更划算；
+- candidates 在 CPU 上先剪掉不可能投票的视图（水体签名视图看不到本块、投票区域落不到水格上、待复核格子碰不到水格），
+  无水块几乎不再解码掩码；
+- samples / write 只读范围相邻块的结果，近邻定尺度只读距离上界以内的分片；reconcile 定水位为 O(n log n)。
+  以上都不改变结果：滑梯数据重切成 54 块的压测中，输出与优化前逐字节一致，总耗时 609 s → 316 s
+  （candidates 295 s → 70 s，detect 296 s → 228 s）。
+
 ## 与 Python 版的对应
 
 | 阶段 | 内容 | Python 来源 |

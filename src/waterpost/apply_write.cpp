@@ -878,10 +878,26 @@ void run_samples(const Config& config, const std::string& name)
         }
     }
     const double radius = spacing * .72;
+    std::size_t candidate_files = 1;
     if (total_water)
     {
         for (const BlockRecord& block : report.blocks)
         {
+            // 候选格只落在所属块的范围内（± 半格）：范围离本块水点太远的块不可能相关，不读它的 candidates。
+            if (block.name != name)
+            {
+                double gap = 0;
+                for (int a = 0; a < 2; ++a)
+                {
+                    const double d = std::max({wlow[a] - (block.bounds.maximum[a] + spacing), (block.bounds.minimum[a] - spacing) - whigh[a], 0.0});
+                    gap += d * d;
+                }
+                if (std::sqrt(gap) > radius * (1 + 1e-9) + 1e-9)
+                {
+                    continue;
+                }
+            }
+            candidate_files += block.name == name ? 0 : 1;
             const Candidates other = block.name == name ? Candidates() : load_candidates(config, block.name);
             const Json& bodies = (block.name == name ? own : other).metadata.at("bodies");
             std::vector<int> relevant;
@@ -1056,6 +1072,7 @@ void run_samples(const Config& config, const std::string& name)
     write_json_atomic(target / "metadata.json", metadata, false);
     log("[SAMPLES] %s: %zu new water samples, %zu footprint cells (%.1fs)", name.c_str(), out.ids.size(),
         out.footprint_ids.size(), total.seconds());
+    log("[SAMPLES] %s: read candidates of %zu/%zu blocks", name.c_str(), candidate_files, report.blocks.size());
 }
 
 void run_model(const Config& config)
@@ -1149,6 +1166,20 @@ void run_write(const Config& config, const std::string& name)
         accepted[static_cast<int>(jint(s.at("water_id")))] = {jnum(s.at("height")), rgb};
     }
     const Samples samples = load_samples(config, name);
+    // 其他块的 samples 只按需读一次（清理窗口与近邻定尺度共用）。
+    std::map<std::string, Samples> sample_cache;
+    auto samples_of = [&](const std::string& block_name) -> const Samples& {
+        if (block_name == name)
+        {
+            return samples;
+        }
+        auto found = sample_cache.find(block_name);
+        if (found == sample_cache.end())
+        {
+            found = sample_cache.emplace(block_name, load_samples(config, block_name)).first;
+        }
+        return found->second;
+    };
     std::vector<std::int64_t> voted;
     for (std::size_t k = 0; k < samples.source_ids.size(); ++k)
     {
@@ -1264,7 +1295,19 @@ void run_write(const Config& config, const std::string& name)
         }
         for (const BlockRecord& other : report.blocks)
         {
-            const Samples s = other.name == name ? samples : load_samples(config, other.name);
+            // 足迹格在所属块的范围内（± 一格）：范围与清理窗口不相交的块跳过，不读它的 samples。
+            bool overlaps = true;
+            for (int a = 0; a < 2; ++a)
+            {
+                const std::int64_t first = static_cast<std::int64_t>(std::floor((other.bounds.minimum[a] - spacing - grid.origin[a]) / spacing)) - 1;
+                const std::int64_t last = static_cast<std::int64_t>(std::ceil((other.bounds.maximum[a] + spacing - grid.origin[a]) / spacing)) + 1;
+                overlaps &= last >= low[a] && first < low[a] + size[a];
+            }
+            if (!overlaps)
+            {
+                continue;
+            }
+            const Samples& s = samples_of(other.name);
             for (std::size_t k = 0; k < s.footprint_ids.size(); ++k)
             {
                 const std::int64_t lx = s.footprint_cells[2 * k] - low[0], ly = s.footprint_cells[2 * k + 1] - low[1];
@@ -1402,6 +1445,7 @@ void run_write(const Config& config, const std::string& name)
     const Json& index = model.at("plan_index");
     std::vector<Vec3> new_position, new_scale;
     std::vector<std::array<double, 3>> new_rgb;
+    std::size_t reference_shards_read = 0, reference_shards_total = 0;
     for (const auto& [wid, value] : accepted)
     {
         std::vector<std::size_t> rows;
@@ -1416,11 +1460,65 @@ void run_write(const Config& config, const std::string& name)
         {
             continue;
         }
+        // 近邻参照只需要本块点附近的分片：先只用本块自己的点算出每点第 kk 近邻距离的上界 reach（加入更多点只会
+        // 让近邻更近），离本块点包围盒超过 reach 的分片不可能含有近邻，不读。本块点不足 kk 个时退回读全部分片。
+        const Json& shards = index.at(std::to_string(wid));
+        std::size_t total_points = 0;
+        for (const Json& shard : shards)
+        {
+            total_points += static_cast<std::size_t>(jint(shard.at("count")));
+        }
+        const std::size_t kk = std::min<std::size_t>(4, total_points);
+        const double cell = std::max(config.spacing, spacing);
+        double reach = std::numeric_limits<double>::infinity();
+        double own_low[2] = {1e300, 1e300}, own_high[2] = {-1e300, -1e300};
+        if (kk > 0 && rows.size() >= kk)
+        {
+            std::vector<double> own(3 * rows.size());
+            for (std::size_t q = 0; q < rows.size(); ++q)
+            {
+                for (int a = 0; a < 3; ++a)
+                {
+                    own[3 * q + a] = samples.points[3 * rows[q] + a];
+                }
+                for (int a = 0; a < 2; ++a)
+                {
+                    own_low[a] = std::min(own_low[a], own[3 * q + a]);
+                    own_high[a] = std::max(own_high[a], own[3 * q + a]);
+                }
+            }
+            const PlaneIndex own_plane(own, cell);
+            std::vector<double> worst(rows.size(), 0.0);
+            parallel_ranges(rows.size(), 4096, [&](std::size_t begin, std::size_t end) {
+                for (std::size_t q = begin; q < end; ++q)
+                {
+                    worst[q] = own_plane.nearest(own[3 * q], own[3 * q + 1], kk).back();
+                }
+            });
+            reach = *std::max_element(worst.begin(), worst.end());
+        }
         std::vector<double> reference;
-        for (const Json& shard : index.at(std::to_string(wid)))
+        std::size_t shards_read = 0;
+        for (const Json& shard : shards)
         {
             const std::string other = shard.at("block").get<std::string>();
-            const Samples s = other == name ? samples : load_samples(config, other);
+            if (other != name && std::isfinite(reach))
+            {
+                const Json& b = shard.at("bbox");
+                double gap = 0;
+                for (int a = 0; a < 2; ++a)
+                {
+                    const double lo = jnum(b.at("minimum")[static_cast<std::size_t>(a)]), hi = jnum(b.at("maximum")[static_cast<std::size_t>(a)]);
+                    const double d = std::max({own_low[a] - hi, lo - own_high[a], 0.0});
+                    gap += d * d;
+                }
+                if (std::sqrt(gap) > reach * (1 + 1e-9) + 1e-9)
+                {
+                    continue;
+                }
+            }
+            ++shards_read;
+            const Samples& s = samples_of(other);
             for (std::size_t k = 0; k < s.ids.size(); ++k)
             {
                 if (s.ids[k] == wid)
@@ -1429,8 +1527,9 @@ void run_write(const Config& config, const std::string& name)
                 }
             }
         }
-        const std::size_t kk = std::min<std::size_t>(4, reference.size() / 3);
-        const PlaneIndex plane(reference, std::max(config.spacing, spacing));
+        reference_shards_read += shards_read;
+        reference_shards_total += shards.size();
+        const PlaneIndex plane(reference, cell);
         std::vector<Vec3> scales(rows.size());
         parallel_ranges(rows.size(), 4096, [&](std::size_t begin, std::size_t end) {
             for (std::size_t q = begin; q < end; ++q)
@@ -1646,10 +1745,15 @@ void run_write(const Config& config, const std::string& name)
     record["water_carve"] = carve_stats;
     record["denoise"] = denoise_stats;
     record["changes"] = changes;
+    record["reference_shards_read"] = reference_shards_read;
+    record["reference_shards_total"] = reference_shards_total;
+    record["samples_files_read"] = sample_cache.size() + 1;
     record["seconds"] = total.seconds();
     write_json_atomic(out / "record.json", record, false);
     log("[WRITE] %s: removed %zu (voted %zu, carved %zu), added %zu, %zu/%zu leaves rewritten (%.1fs)", name.c_str(),
         removed.size(), voted.size(), carved.size(), new_position.size(), touched.size(), leaves, total.seconds());
+    log("[WRITE] %s: read samples of %zu/%zu blocks, %zu/%zu reference shards", name.c_str(), sample_cache.size() + 1,
+        report.blocks.size(), reference_shards_read, reference_shards_total);
 }
 
 void run_finalize(const Config& config)

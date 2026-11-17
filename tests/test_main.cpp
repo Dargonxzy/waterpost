@@ -3,11 +3,16 @@
 #include "lod.hpp"
 #include "npz.hpp"
 #include "npz_util.hpp"
+#include "project.hpp"
+#include "shore.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <limits>
+#include <random>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -158,6 +163,128 @@ void test_npz_round_trip()
     }
 }
 
+// 旧的 O(n²) 实现，原样保留作对照。
+ShoreLevel shore_level_reference(const std::vector<double>& z, double tolerance = .6)
+{
+    const double med = median(z);
+    std::vector<double> candidates;
+    for (double value : z)
+    {
+        if (value <= med)
+        {
+            candidates.push_back(value);
+        }
+    }
+    std::vector<std::size_t> scores(candidates.size(), 0);
+    std::size_t best_score = 0;
+    for (std::size_t c = 0; c < candidates.size(); ++c)
+    {
+        for (double value : z)
+        {
+            scores[c] += std::abs(value - candidates[c]) <= tolerance / 2 ? 1 : 0;
+        }
+        best_score = std::max(best_score, scores[c]);
+    }
+    double center = std::numeric_limits<double>::infinity();
+    for (std::size_t c = 0; c < candidates.size(); ++c)
+    {
+        if (scores[c] == best_score)
+        {
+            center = std::min(center, candidates[c]);
+        }
+    }
+    ShoreLevel result;
+    result.inliers.assign(z.size(), 0);
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < z.size(); ++i)
+    {
+        result.inliers[i] = std::abs(z[i] - center) <= tolerance / 2;
+        count += result.inliers[i];
+    }
+    if (count < 3)
+    {
+        center = quantile(z, .2);
+        count = 0;
+        for (std::size_t i = 0; i < z.size(); ++i)
+        {
+            result.inliers[i] = std::abs(z[i] - center) <= tolerance;
+            count += result.inliers[i];
+        }
+    }
+    if (count)
+    {
+        std::vector<double> chosen;
+        for (std::size_t i = 0; i < z.size(); ++i)
+        {
+            if (result.inliers[i])
+            {
+                chosen.push_back(z[i]);
+            }
+        }
+        result.height = median(chosen);
+    }
+    else
+    {
+        result.height = center;
+    }
+    return result;
+}
+
+std::vector<double> random_shore(std::mt19937_64& rng, std::size_t n)
+{
+    // 水位附近的一簇 + 岸坡上的散点 + 少量离群；一部分取整到毫米，制造并列与重复值。
+    std::uniform_real_distribution<double> uniform(0, 1);
+    std::normal_distribution<double> noise(0, 0.08);
+    const double level = uniform(rng) * 20 - 10;
+    std::vector<double> z(n);
+    for (double& v : z)
+    {
+        const double u = uniform(rng);
+        v = u < .6 ? level + noise(rng) : u < .95 ? level + uniform(rng) * 3 : level + (uniform(rng) - .5) * 40;
+        if (uniform(rng) < .3)
+        {
+            v = std::round(v * 1000) / 1000;
+        }
+    }
+    return z;
+}
+
+void test_shore_level()
+{
+    std::mt19937_64 rng(20261117);
+    std::size_t cases = 0;
+    for (int trial = 0; trial < 3000; ++trial)
+    {
+        const std::size_t n = 3 + static_cast<std::size_t>(rng() % (trial < 2500 ? 60 : 3000));
+        const std::vector<double> z = random_shore(rng, n);
+        for (double tolerance : {.6, .2, 1.5})
+        {
+            const ShoreLevel a = shore_level(z, tolerance), b = shore_level_reference(z, tolerance);
+            ++cases;
+            EXPECT(a.height == b.height && a.inliers == b.inliers, "shore_level differs (n=%zu, tol=%.2f): %.9f vs %.9f", n,
+                   tolerance, a.height, b.height);
+        }
+    }
+    std::printf("shore_level: %zu random cases identical to the O(n^2) reference\n", cases);
+    for (std::size_t n : {20000, 100000, 1000000})
+    {
+        const std::vector<double> z = random_shore(rng, n);
+        auto t0 = std::chrono::steady_clock::now();
+        const ShoreLevel a = shore_level(z);
+        const double fast = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double slow = -1;
+        if (n <= 20000)
+        {
+            t0 = std::chrono::steady_clock::now();
+            const ShoreLevel b = shore_level_reference(z);
+            slow = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            EXPECT(a.height == b.height && a.inliers == b.inliers, "shore_level differs at n=%zu", n);
+        }
+        std::printf("shore_level n=%zu: new %.3fs%s\n", n, fast,
+                    slow >= 0 ? (", old " + std::to_string(slow) + "s").c_str() : "");
+    }
+}
+
 } // namespace
 
 int main()
@@ -165,6 +292,7 @@ int main()
     test_float_to_half();
     test_posix_paths();
     test_npz_round_trip();
+    test_shore_level();
     if (g_failures)
     {
         std::printf("%d check(s) FAILED\n", g_failures);

@@ -8,6 +8,8 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <map>
+#include <memory>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -43,6 +45,19 @@ void decompress(const std::vector<std::uint8_t>& payload, void* data, std::size_
 
 MaskCache::MaskCache(int water_class, std::size_t budget_bytes) : m_water_class(water_class), m_budget(budget_bytes)
 {
+}
+
+MaskCache& shared_mask_cache(int water_class)
+{
+    static std::mutex mutex;
+    static std::map<int, std::unique_ptr<MaskCache>> caches;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_ptr<MaskCache>& cache = caches[water_class];
+    if (!cache)
+    {
+        cache = std::make_unique<MaskCache>(water_class, std::size_t{2} << 30);
+    }
+    return *cache;
 }
 
 std::size_t MaskCache::decodes() const
