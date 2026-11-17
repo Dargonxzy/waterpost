@@ -1160,6 +1160,10 @@ void run_write(const Config& config, const std::string& name)
     std::sort(voted.begin(), voted.end());
     const LodIndex lod = read_lod_index(config.lod);
     const LodBlock* block = lod.block(name);
+    if (!block)
+    {
+        fail_value("Block is not present in the LOD: " + name);
+    }
     std::vector<std::size_t> leaf_offsets;
     const Gaussians g = read_block_gaussians(lod, *block, &leaf_offsets);
     const std::size_t n = g.count;
@@ -1177,18 +1181,32 @@ void run_write(const Config& config, const std::string& name)
     const std::filesystem::path dir = detect_dir(config, name);
     if (config.water_carve && !accepted.empty() && n)
     {
+        // detect 交接文件里的下标都指向本块最细层高斯：LOD 在 detect 之后变了就会越界，先检查。
+        auto check_rows = [&](const std::vector<std::int64_t>& rows, const char* what) {
+            for (std::int64_t r : rows)
+            {
+                if (r < 0 || static_cast<std::size_t>(r) >= n)
+                {
+                    fail_value(std::string(what) + " index outside the LOD block " + name + ": the LOD changed after detect");
+                }
+            }
+        };
         const std::vector<std::int64_t> shore = npz_get<std::int64_t>(NpzReader(dir / "components.npz"), "shore_indices");
+        check_rows(shore, "Shoreline");
         std::vector<std::uint8_t> land(n, 0), bank_rendered(n, 0), float_rendered(n, 0), whole_on_water(n, 0), on_land(n, 0);
         bool has_land = false, has_visible = false;
         if (std::filesystem::is_regular_file(dir / "carve_evidence.npz"))
         {
             const NpzReader reader(dir / "carve_evidence.npz");
-            for (std::int64_t r : npz_get<std::int64_t>(reader, "land_indices"))
+            const std::vector<std::int64_t> land_rows = npz_get<std::int64_t>(reader, "land_indices");
+            check_rows(land_rows, "Land");
+            for (std::int64_t r : land_rows)
             {
                 land[static_cast<std::size_t>(r)] = 1;
             }
             has_land = true;
             const std::vector<std::int64_t> rows = npz_get<std::int64_t>(reader, "visible_water_indices");
+            check_rows(rows, "Visible-water");
             const std::vector<std::uint8_t> fraction = npz_get<std::uint8_t>(reader, "visible_water_fraction");
             const std::vector<std::uint8_t> geometry = npz_get<std::uint8_t>(reader, "visible_water_geometry");
             for (std::size_t k = 0; k < rows.size(); ++k)
@@ -1199,6 +1217,10 @@ void run_write(const Config& config, const std::string& name)
                 whole_on_water[r] = geometry[k] / 255.0 >= config.carve_float_geometry_water;
             }
             const std::vector<std::uint8_t> share = npz_get<std::uint8_t>(reader, "visible_water_u8");
+            if (share.size() != n || fraction.size() != rows.size() || geometry.size() != rows.size())
+            {
+                fail_value("Carve evidence does not match the LOD block " + name + ": the LOD changed after detect");
+            }
             for (std::size_t i = 0; i < n; ++i)
             {
                 on_land[i] = share[i] != 255 && share[i] < 127;

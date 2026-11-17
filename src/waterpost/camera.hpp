@@ -106,7 +106,6 @@ inline bool project_point(const View& view, const double* point, double& u, doub
         v = p[1] * y + p[3];
         return true;
     case 2: // SIMPLE_RADIAL
-    case 8: // SIMPLE_RADIAL_FISHEYE
     {
         const double r2 = x * x + y * y;
         const double radial = 1 + p[3] * r2;
@@ -115,7 +114,6 @@ inline bool project_point(const View& view, const double* point, double& u, doub
         return true;
     }
     case 3: // RADIAL
-    case 9: // RADIAL_FISHEYE
     {
         const double r2 = x * x + y * y;
         const double radial = 1 + p[3] * r2 + p[4] * r2 * r2;
@@ -124,7 +122,6 @@ inline bool project_point(const View& view, const double* point, double& u, doub
         return true;
     }
     case 4: // OPENCV
-    case 5: // OPENCV_FISHEYE
     case 6: // FULL_OPENCV
     {
         const double fx = p[0], fy = p[1], cx = p[2], cy = p[3], k1 = p[4], k2 = p[5], p1 = p[6], p2 = p[7];
@@ -136,7 +133,7 @@ inline bool project_point(const View& view, const double* point, double& u, doub
         v = fy * yd + cy;
         return true;
     }
-    default:
+    default: // 鱼眼模型（5 / 8 / 9 …）需要 θ 畸变公式，不用透视公式近似，直接报不支持。
         unsupported_camera_model(view.model);
     }
 }

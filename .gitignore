@@ -3,3 +3,4 @@ compare/
 _to_delete/
 .runner/
 __pycache__/
+runner.ps1

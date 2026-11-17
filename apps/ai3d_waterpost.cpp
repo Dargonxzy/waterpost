@@ -62,6 +62,8 @@ std::vector<std::string> arguments(int argc, char** argv)
 
 const char* HELP =
     "usage: ai3d_waterpost <stage> --work DIR [options]\n"
+    "       ai3d_waterpost evaluate (--project DIR | --poses FILE --mask-dir DIR --images DIR) --out CSV\n"
+    "                               --variant name=LOD [--variant ...] [--step N] [--views a.jpg,b.jpg] [--gpu-id N]\n"
     "stages: all split assign scene detect reconcile candidates active samples model write finalize\n"
     "  --mode blocks|poses  blocks: cameras/blocks from <project>/artifacts/blocks; poses: LOD + --poses JSON\n"
     "  --project DIR        task directory (artifacts/blocks, bbox.json); required in blocks mode\n"
@@ -133,6 +135,10 @@ int main(int argc, char** argv)
                 else if (key == "--variant")
                 {
                     const std::size_t eq = value.find('=');
+                    if (eq == std::string::npos || eq == 0)
+                    {
+                        fail_value("--variant expects name=LOD_DIR: " + value);
+                    }
                     variants.emplace_back(value.substr(0, eq), utf8_path(value.substr(eq + 1)));
                 }
                 else fail_value("Unknown evaluate option " + key);
@@ -240,6 +246,28 @@ int main(int argc, char** argv)
         else
         {
             config = load_config(work_dir);
+            // work 目录已经有 config.json：输入只在第一次运行时确定。再传不同的输入说明想处理另一份数据，
+            // 静默沿用旧路径会算错，直接报错。
+            auto same = [](const std::filesystem::path& a, const std::string& b) {
+                return canonical_path_text(a) == canonical_path_text(std::filesystem::absolute(utf8_path(b)));
+            };
+            auto check = [&](const std::string& given, const std::filesystem::path& stored, const char* option) {
+                if (!given.empty() && !same(stored, given))
+                {
+                    fail_value(std::string(option) + " differs from " + path_utf8(work_dir / "config.json") + " (" +
+                               path_utf8(stored) + "); use a new --work directory for different inputs");
+                }
+            };
+            if (!config.project.empty()) check(project, config.project, "--project");
+            check(lod, config.lod, "--lod");
+            check(masks, config.mask_dir, "--mask-dir");
+            if (!mode.empty() && mode != config.mode)
+            {
+                fail_value("--mode " + mode + " differs from config.json (" + config.mode + "); use a new --work directory");
+            }
+            if (!config.poses.empty()) check(poses, config.poses, "--poses");
+            if (!config.bbox.empty()) check(bbox, config.bbox, "--bbox");
+            if (!config.roi.empty()) check(roi, config.roi, "--roi");
         }
         if (!poses.empty()) config.poses = std::filesystem::absolute(utf8_path(poses));
         if (!bbox.empty()) config.bbox = std::filesystem::absolute(utf8_path(bbox));
@@ -247,10 +275,6 @@ int main(int argc, char** argv)
         if (!output.empty())
         {
             config.output = std::filesystem::absolute(utf8_path(output));
-        }
-        if (!mode.empty())
-        {
-            config.mode = mode;
         }
         if (debug)
         {
@@ -309,7 +333,20 @@ int main(int argc, char** argv)
         };
         auto per_block = [&](void (*function)(const Config&, const std::string&), const char* label) {
             // 块清单来自 work/scene（scene 阶段之后才有）。
-            const std::vector<std::string> blocks = tiles.empty() ? pipeline_blocks(config) : tiles;
+            const std::vector<std::string> known = pipeline_blocks(config);
+            for (const std::string& tile : tiles)
+            {
+                if (std::find(known.begin(), known.end(), tile) == known.end())
+                {
+                    std::string list;
+                    for (const std::string& name : known)
+                    {
+                        list += (list.empty() ? "" : ", ") + name;
+                    }
+                    fail_value("Unknown --tile-name " + tile + "; blocks: " + list);
+                }
+            }
+            const std::vector<std::string> blocks = tiles.empty() ? known : tiles;
             for (const std::string& block : blocks)
             {
                 const Timer timer;

@@ -247,7 +247,7 @@ std::vector<std::uint8_t> signature_image(MaskCache& cache, const View& view, co
 {
     const Labels labels = cache.labels(view);
     std::vector<std::uint8_t> lut(labels.areas.size() + 1, 2);
-    lut[0] = exact_only ? 0 : 0;
+    lut[0] = 0; // 背景（非水）
     for (int label : wanted)
     {
         if (label >= 0 && static_cast<std::size_t>(label) < lut.size())

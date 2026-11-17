@@ -375,6 +375,19 @@ std::vector<View> read_pose_views(const std::filesystem::path& path, const std::
         }
         view.model = camera.model;
         view.model_id = model_id_of(camera.model);
+        {
+            static const int counts[] = {3, 4, 4, 5, 8, 8, 12, 5, 4, 5, 12};
+            const std::size_t expected = static_cast<std::size_t>(counts[view.model_id]);
+            if (camera.params.size() != expected)
+            {
+                fail_value("Pose file: camera of image " + view.name + " (" + camera.model + ") needs " +
+                           std::to_string(expected) + " params, got " + std::to_string(camera.params.size()));
+            }
+            if (camera.width <= 0 || camera.height <= 0)
+            {
+                fail_value("Pose file: camera of image " + view.name + " has a non-positive size");
+            }
+        }
         view.width = camera.width;
         view.height = camera.height;
         view.params = camera.params;

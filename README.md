@@ -19,6 +19,11 @@ ai3d_waterpost.exe all --project D:\data\滑梯_20261025183928 --work D:\data\�
   用 `--tile-name` 按块分发；`split`、`scene`、`reconcile`、`active`、`model`、`finalize` 是全局步骤；所有阶段共用 `--work`
   （第一次 split / assign / all 写入 `config.json`，后续阶段直接读）；
 - `--link-output`：未改写的文件用硬链接代替复制（同一磁盘时）；`--debug` 额外保存逐点投票数组。
+- 输入（`--project`、`--lod`、`--mask-dir`、`--mode`、`--poses`、`--bbox`、`--roi`）在第一次运行时写进 `work\config.json`，
+  之后的阶段直接读；再传不同的值会报错（换一个新的 `--work`）。分机时各机器必须用**同一绝对路径**访问 work、LOD、掩码与位姿
+  （视图以掩码的绝对路径为键），盘符不同就用统一的 UNC 路径；
+- 可以往同一个 `--output` 重跑：finalize 会把上次改写、这次没改写的文件换回输入内容（按大小与修改时间判断），并删掉
+  上次留下的 `_water<k>` 溢出节点；detect 重跑时先清掉本块上一次的交接文件。
 
 ## 场景准备（split / assign / scene）与 poses 模式
 
@@ -77,7 +82,7 @@ bin 带语义字节时（`gssp-semantic16-v1`），新增的水面高斯写成�
 ## 补水范围与节点容量
 
 - 补水范围 = 工程 bbox ∩ ROI 多边形（`roi.json` 的 projected 点经 Normalizer 换到本地坐标；没有 roi.json 时不限）∩ LOD 各块瓦片的 XY 范围。
-  足迹格中心必须在范围内；跨边界的采样矩形拆成单格，只留中心在范围内的格；ROI 边缘的水面高斯尺度按到边界的距离收紧。
+  足迹格中心必须在范围内；跨边界的采样矩形按中心取舍（中心在范围内整块保留，否则整块丢弃，不拆成单格）；ROI 边缘的水面高斯尺度按到边界的距离收紧。
 - 每个叶节点的点数不超过本块原始最细层叶节点的最大记录数（导出时的 max_splat_num，如 61440）。装不下的水面点写进
   `<叶名>_water<k>.bin`，作为兄弟节点挂到同一父节点下（两种布局都处理；旧布局同时生成对应的节点 JSON）。
 

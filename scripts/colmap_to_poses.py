@@ -38,6 +38,8 @@ def read_images(path):
             name = bytearray()
             while True:
                 c = f.read(1)
+                if not c:
+                    raise ValueError("truncated images.bin: %s" % path)
                 if c == b"\0":
                     break
                 name += c

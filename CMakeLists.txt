@@ -106,4 +106,11 @@ if(WIN32)
     target_link_libraries(ai3d_waterpost PRIVATE shell32)
 endif()
 
+# 单元测试（纯函数）：ctest，或直接运行 ai3d_waterpost_tests.exe。
+enable_testing()
+add_executable(ai3d_waterpost_tests tests/test_main.cpp)
+ai3d_waterpost_compile_settings(ai3d_waterpost_tests)
+target_link_libraries(ai3d_waterpost_tests PRIVATE ai3d_waterpost_lib)
+add_test(NAME ai3d_waterpost_tests COMMAND ai3d_waterpost_tests)
+
 install(TARGETS ai3d_waterpost RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

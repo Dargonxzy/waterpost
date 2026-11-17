@@ -358,6 +358,12 @@ void run_detect(const Config& config, const std::string& name)
     const Timer total;
     const std::filesystem::path out = config.work / "detect" / utf8_path(name);
     std::filesystem::create_directories(out);
+    // 先删掉上一次的交接文件：本次无水时有些文件不会写，下游（含邻块）只看文件在不在，旧文件会被当成本次结果。
+    for (const char* file : {"components.json", "components.npz", "seeds.npz", "deletion_evidence.npz", "carve_evidence.npz",
+                             "land_grid.npz", "occupancy.npz", "detections.npz"})
+    {
+        remove_file_if_exists(out / file);
+    }
     const LodIndex lod = read_lod_index(config.lod);
     const LodBlock* block = lod.block(name);
     if (!block)

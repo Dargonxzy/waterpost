@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <regex>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -513,9 +514,10 @@ std::uint16_t float_to_half(float value)
         }
         const std::uint32_t shift = 126u - (magnitude >> 23);
         const std::uint32_t mantissa = (magnitude & 0x7fffffu) | 0x800000u;
-        std::uint32_t half = mantissa >> (shift + 1);
-        const std::uint32_t remainder = mantissa & ((1u << (shift + 1)) - 1u);
-        const std::uint32_t midpoint = 1u << shift;
+        // 次正规半精度：值 = half * 2^-24，float 值 = mantissa * 2^(e - 150)，所以 half = mantissa >> (126 - e)。
+        std::uint32_t half = mantissa >> shift;
+        const std::uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const std::uint32_t midpoint = 1u << (shift - 1u);
         if (remainder > midpoint || (remainder == midpoint && (half & 1u)))
         {
             ++half;
@@ -650,7 +652,37 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
             siblings[change.sibling_of].push_back(&change);
         }
     }
-    // 1) 复制未改写的文件。
+    // 0) 上一次写到同一 output 的溢出兄弟节点（<叶>_water<k>.bin / .json）不在本次结果里时删掉，
+    //    免得留下没人引用的旧文件。只动这种命名的文件，不碰 output 里的其他内容。
+    if (fs::is_directory(output))
+    {
+        static const std::regex water_sibling(R"(.*_water\d+\.(bin|json)$)");
+        std::vector<fs::path> stale;
+        for (const fs::directory_entry& entry : fs::recursive_directory_iterator(output))
+        {
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+            const std::string key = fs::relative(entry.path(), output).generic_u8string();
+            if (!std::regex_match(key, water_sibling) || by_uri.count(key) || fs::exists(input / fs::relative(entry.path(), output)))
+            {
+                continue;
+            }
+            stale.push_back(entry.path());
+        }
+        for (const fs::path& path : stale)
+        {
+            std::error_code error;
+            fs::remove(path, error);
+        }
+        if (!stale.empty())
+        {
+            std::printf("[LOD] removed %zu stale water sibling files from an earlier run\n", stale.size());
+        }
+    }
+    // 1) 复制未改写的文件。目标已存在且大小与修改时间都与输入相同才跳过（复制时会把修改时间设成输入的），
+    //    上一次 write 改写过、这一次没改写的叶节点因此会被换回输入内容。
     fs::create_directories(output);
     std::vector<std::pair<fs::path, fs::path>> copies;
     for (const fs::directory_entry& entry : fs::recursive_directory_iterator(input))
@@ -668,7 +700,7 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
         const fs::path target = output / relative;
         std::error_code error;
         if (fs::is_regular_file(target, error) && fs::file_size(target, error) == entry.file_size() &&
-            !ends_with(key, ".json"))
+            fs::last_write_time(target, error) == entry.last_write_time() && !error && !ends_with(key, ".json"))
         {
             continue;
         }
@@ -692,6 +724,7 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
         {
             fail_runtime("Copy failed: " + path_utf8(source) + " -> " + path_utf8(target) + ": " + error.message());
         }
+        fs::last_write_time(target, fs::last_write_time(source, error), error);
     });
     for (const LeafChange& change : changes)
     {
