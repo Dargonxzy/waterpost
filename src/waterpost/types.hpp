@@ -89,7 +89,11 @@ struct Config
     std::filesystem::path work;
     std::filesystem::path output;
     std::string mode = "blocks";        // blocks（有分块成果）| poses（LOD + 位姿 JSON + 掩码）
-    std::filesystem::path poses;        // poses：位姿 JSON
+    std::filesystem::path poses;        // poses：位姿 JSON（cameras 与 images 在同一文件）
+    std::filesystem::path cameras;      // poses：或者分开的 cameras.json
+    std::filesystem::path images;       // poses：与 images.json
+    std::string image_root;             // poses：图像名去掉这个前缀后对应掩码（空 = 自动找）
+    std::string pose_crs = "auto";      // poses：auto | none | EPSG:326NN / EPSG:327NN
     std::filesystem::path bbox;         // poses：可选 bbox.json（工程范围与 ROI 的 Normalizer）
     std::filesystem::path roi;          // poses：可选 roi.json（需要 bbox）
     double view_margin = 0.5;           // poses：相机中心 XY 可在块范围外 view_margin * 块边长之内

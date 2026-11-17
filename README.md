@@ -52,18 +52,35 @@ ai3d_waterpost.exe assign --list W\assign\lists\part_00.list --work W     &:: �
 ai3d_waterpost.exe scene --work W
 ```
 
-位姿 JSON（`scripts\colmap_to_poses.py <sparse> <out.json>` 可以从 COLMAP sparse 生成）：坐标系必须与 LOD 相同（本地坐标），
-相机为去畸变后的 PINHOLE / SIMPLE_PINHOLE，掩码对应去畸变后的图像。
+位姿有两种给法（都在 poses 模式下，二选一）：
+
+- `--poses FILE`：一个 JSON 同时含 `cameras` 与 `images`（`scripts\colmap_to_poses.py <sparse> <out.json>` 可以从 COLMAP sparse 生成）；
+- `--cameras FILE --images FILE`：分开的两个 JSON。两种写法都接受数组或以 id 为键的对象：
 
 ```json
-{"cameras": [{"id": 1, "model": "PINHOLE", "width": 2640, "height": 1912, "params": [fx, fy, cx, cy]}],
- "images":  [{"name": "DJI_0001.jpg", "camera_id": 1, "qvec": [w, x, y, z], "tvec": [x, y, z]}]}
+cameras.json  {"1": {"width": 8192, "height": 5468, "model": "OPENCV", "params": [fx, fy, cx, cy, k1, k2, p1, p2]}, ...}
+images.json   {"1": {"name": "//server/data/.../A/A00001.JPG", "camera_id": 1, "q": [w, x, y, z], "t": [x, y, z]}, ...}
 ```
 
-- 位姿任选一种：`qvec`+`tvec`（COLMAP 世界→相机）、`R`+`t`（世界→相机，3×3 嵌套或 9 个数）、`R`+`center`、`camera_to_world`（4×4）；
-- 相机可以写在 `cameras`（数组或以 id 为键的对象）里用 `camera_id` 引用，也可以每张图内联 `"camera": {...}`；
-  相机也接受 `fx`/`fy`/`cx`/`cy` 字段；
-- 掩码默认 `<mask-dir>\<图像名换成 .png>`，也可以每张图给 `"mask"`（相对 `--mask-dir` 或绝对路径）；没有掩码的视图跳过。
+- 位姿任选一种：`q`/`qvec` + `t`/`tvec`（COLMAP 世界→相机）、`R`+`t`、`R`+`center`、`camera_to_world`（4×4）；相机可以内联 `"camera": {...}`，
+  也接受 `fx`/`fy`/`cx`/`cy` 字段；
+- **相机模型**：PINHOLE / SIMPLE_PINHOLE 直接用；SIMPLE_RADIAL / RADIAL / OPENCV / FULL_OPENCV 当作带畸变的原始相机：投影一律用内参不变的
+  针孔相机，掩码（和 evaluate 的照片）读入时按原始相机去畸变（掩码最近邻、照片双线性，不另存文件）；畸变系数全 0 时就是针孔；鱼眼模型不支持。
+  后续各阶段只看到针孔相机与去畸变后的掩码，不需要任何改动；blocks 模式的相机来自去畸变后的 `sparse\0`，不走这条路；
+- **掩码**：`<--mask-dir>/<图像名去掉开头若干级目录，扩展名换成 .png>`，子目录层级照搬图像路径。去掉几级默认自动找（用前几张图从 0 级起试，
+  第一个能在掩码目录下找到文件的级数用于全部图像；Windows 下不区分大小写），也可以用 `--image-root PREFIX` 指定要去掉的前缀；
+  每张图也可以用 `"mask"` 字段单独指定。两张图对到同一个掩码时报错；
+- **坐标**：`--pose-crs auto`（默认）时，相机中心明显是投影坐标（量级 > 10 万米）就用 LOD 根节点 `transform` 的平移（本地原点的 ECEF 坐标）
+  换成经纬度、按经度取 UTM 带，把位姿平移到 LOD 本地坐标（本地坐标 = 投影坐标 − 原点投影坐标，在滑梯数据上与 bbox.json 的 Normalizer
+  一致到 0.1 mm）；`--pose-crs EPSG:326NN / EPSG:327NN` 指定带号，`none` 表示已是本地坐标。读完后检查相机是否在 LOD 附近，
+  坐标系不对会直接报错。
+
+验证：用滑梯数据造了同形态的仿真输入（两文件格式、绝对网络路径的图像名、多级且大小写不同的掩码目录）：针孔相机 + 本地坐标时输出与
+`--poses` 结果逐字节一致；再加 OPENCV 畸变（两台相机）与 UTM 50N 坐标时，水位差 6 mm、新增水面点差 0.08%，evaluate 的水 / 非水 PSNR
+增量一致（差异来自掩码一次加畸变、一次去畸变的最近邻取整）。
+
+`evaluate` 也接受 `--poses` 或 `--cameras` + `--images`（`--photos DIR` 是照片目录，照片路径与掩码一样自动对上子目录），畸变相机的照片
+先去畸变再与针孔渲染比较；它是单独的检查命令，不在 `all` 里运行。
 
 ## 规模与性能
 

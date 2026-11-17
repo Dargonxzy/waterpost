@@ -2,6 +2,7 @@
 
 #include "error.hpp"
 #include "fs_util.hpp"
+#include "parallel.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -45,6 +46,70 @@ void decompress(const std::vector<std::uint8_t>& payload, void* data, std::size_
 
 MaskCache::MaskCache(int water_class, std::size_t budget_bytes) : m_water_class(water_class), m_budget(budget_bytes)
 {
+}
+
+namespace
+{
+
+// 针孔像素中心 (u, v) -> 原始（畸变）图像上的连续坐标。
+void raw_position(const View& view, double u, double v, double& ud, double& vd)
+{
+    double fx, fy, cx, cy;
+    raw_intrinsics(view.raw_model_id, view.raw_params, fx, fy, cx, cy);
+    double xd, yd;
+    distort_normalized(view.raw_model_id, view.raw_params, (u - cx) / fx, (v - cy) / fy, xd, yd);
+    ud = fx * xd + cx;
+    vd = fy * yd + cy;
+}
+
+} // namespace
+
+cv::Mat undistort_nearest(const View& view, const cv::Mat& classes)
+{
+    if (classes.type() != CV_8UC1)
+    {
+        fail_value("undistort_nearest expects an 8-bit single-channel image");
+    }
+    cv::Mat out(view.height, view.width, CV_8U, cv::Scalar(0));
+    parallel_ranges(static_cast<std::size_t>(view.height), 16, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t y = begin; y < end; ++y)
+        {
+            std::uint8_t* row = out.ptr<std::uint8_t>(static_cast<int>(y));
+            for (int x = 0; x < view.width; ++x)
+            {
+                double ud, vd;
+                raw_position(view, x + .5, static_cast<double>(y) + .5, ud, vd);
+                const double sx = std::floor(ud), sy = std::floor(vd);
+                if (sx >= 0 && sy >= 0 && sx < classes.cols && sy < classes.rows)
+                {
+                    row[x] = classes.at<std::uint8_t>(static_cast<int>(sy), static_cast<int>(sx));
+                }
+            }
+        }
+    });
+    return out;
+}
+
+cv::Mat undistort_bilinear(const View& view, const cv::Mat& image)
+{
+    cv::Mat map_x(view.height, view.width, CV_32F), map_y(view.height, view.width, CV_32F);
+    parallel_ranges(static_cast<std::size_t>(view.height), 16, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t y = begin; y < end; ++y)
+        {
+            float* mx = map_x.ptr<float>(static_cast<int>(y));
+            float* my = map_y.ptr<float>(static_cast<int>(y));
+            for (int x = 0; x < view.width; ++x)
+            {
+                double ud, vd;
+                raw_position(view, x + .5, static_cast<double>(y) + .5, ud, vd);
+                mx[x] = static_cast<float>(ud - .5); // cv::remap 以整数为像素中心
+                my[x] = static_cast<float>(vd - .5);
+            }
+        }
+    });
+    cv::Mat out;
+    cv::remap(image, out, map_x, map_y, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+    return out;
 }
 
 MaskCache& shared_mask_cache(int water_class)
@@ -162,6 +227,10 @@ cv::Mat MaskCache::water(const View& view)
         cv::Mat resized;
         cv::resize(classes, resized, cv::Size(view.width, view.height), 0, 0, cv::INTER_NEAREST);
         classes = resized;
+    }
+    if (view.distorted())
+    {
+        classes = undistort_nearest(view, classes);
     }
     cv::Mat water = (classes == m_water_class) / 255;
     {

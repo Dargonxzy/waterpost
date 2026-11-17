@@ -60,16 +60,56 @@ struct Sum
 
 } // namespace
 
+
+// 照片路径：图像名是存在的绝对路径就直接用；否则在照片目录下找 <图像名去掉前 k 级目录>（k 第一次找到后固定）。
+static std::filesystem::path photo_path(const std::filesystem::path& images, const std::string& name, long long& cut)
+{
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : name)
+    {
+        if (c == '/' || c == '\\')
+        {
+            if (!current.empty()) parts.push_back(current);
+            current.clear();
+        }
+        else
+        {
+            current += c;
+        }
+    }
+    if (!current.empty()) parts.push_back(current);
+    auto under = [&](std::size_t skip) {
+        std::filesystem::path path = images;
+        for (std::size_t k = skip; k < parts.size(); ++k) path /= utf8_path(parts[k]);
+        return path;
+    };
+    if (cut >= 0)
+    {
+        return under(std::min<std::size_t>(static_cast<std::size_t>(cut), parts.size() - 1));
+    }
+    for (std::size_t skip = 0; skip + 1 <= parts.size(); ++skip)
+    {
+        if (std::filesystem::is_regular_file(under(skip)))
+        {
+            cut = static_cast<long long>(skip);
+            return under(skip);
+        }
+    }
+    const std::filesystem::path direct = utf8_path(name);
+    return direct.is_absolute() ? direct : images / direct;
+}
+
 void run_evaluate(const std::filesystem::path& project, const std::vector<std::pair<std::string, std::filesystem::path>>& variants,
                   const std::filesystem::path& mask_dir, const std::filesystem::path& images, int step,
                   const std::filesystem::path& csv, int gpu, int water_class, const std::vector<std::string>& only,
-                  const std::filesystem::path& poses)
+                  const Config* poses)
 {
     gpu_select_device(gpu);
     std::map<std::string, View> unique;
-    if (!poses.empty())
+    if (poses)
     {
-        for (View& view : read_pose_views(poses, mask_dir))
+        for (View& view : read_pose_views(*poses))
         {
             unique.emplace(view.key(), std::move(view));
         }
@@ -128,10 +168,11 @@ void run_evaluate(const std::filesystem::path& project, const std::vector<std::p
     }
     out << "\n";
     const Timer timer;
+    long long photo_cut = -1; // 照片目录下要去掉图像名的前几级目录（第一次找到后固定）
     for (std::size_t k = 0; k < views.size(); ++k)
     {
         const View& view = views[k];
-        const std::filesystem::path image_path = images / utf8_path(view.name);
+        const std::filesystem::path image_path = photo_path(images, view.name, photo_cut);
         cv::Mat photo;
         {
             std::ifstream in(image_path, std::ios::binary);
@@ -148,6 +189,10 @@ void run_evaluate(const std::filesystem::path& project, const std::vector<std::p
         if (photo.cols != view.width || photo.rows != view.height)
         {
             cv::resize(photo, photo, cv::Size(view.width, view.height), 0, 0, cv::INTER_AREA);
+        }
+        if (view.distorted())
+        {
+            photo = undistort_bilinear(view, photo); // 渲染是针孔相机，照片先去畸变才能逐像素比
         }
         const cv::Mat water = masks.water(view);
         const PinholeCamera cam = pinhole(view);

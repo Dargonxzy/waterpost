@@ -69,6 +69,7 @@ add_library(ai3d_waterpost_lib STATIC
     src/waterpost/detect.cpp
     src/waterpost/evaluate.cpp
     src/waterpost/fs_util.cpp
+    src/waterpost/geo.cpp
     src/waterpost/json_util.cpp
     src/waterpost/lod.cpp
     src/waterpost/masks.cpp

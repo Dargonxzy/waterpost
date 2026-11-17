@@ -57,6 +57,12 @@ private:
     std::unordered_map<std::string, std::pair<Entry, std::list<std::string>::iterator>> m_entries;
 };
 
+// 视图带原始畸变相机时，把原始（畸变）图像上的类别图换成针孔图像：每个针孔像素取其中心经原始相机畸变后落入
+// 的原始像素（最近邻，像素 i 覆盖 [i, i+1)），落到原图外为 0。逐行并行计算，不建映射表。
+cv::Mat undistort_nearest(const View& view, const cv::Mat& classes);
+// 照片去畸变（双线性），evaluate 用。
+cv::Mat undistort_bilinear(const View& view, const cv::Mat& image);
+
 // 进程内共享的掩码缓存（按水体类别区分，2 GiB 预算）：同一进程连续处理多块时，相邻块共用的视图只解码一次。
 MaskCache& shared_mask_cache(int water_class);
 

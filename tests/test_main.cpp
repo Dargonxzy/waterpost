@@ -5,6 +5,8 @@
 #include "npz_util.hpp"
 #include "project.hpp"
 #include "shore.hpp"
+#include "geo.hpp"
+#include "masks.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -285,6 +287,73 @@ void test_shore_level()
     }
 }
 
+void test_geo()
+{
+    // 滑梯：LOD 根变换的平移（ECEF）换到 UTM 50N，应与 bbox.json 的 Normalizer 原点一致（< 1 mm）。
+    const Geodetic g = ecef_to_geodetic(-2401151.5303558623, 5379932.625303118, 2435680.754753059);
+    const std::array<double, 2> en = utm_forward(g.latitude, g.longitude, utm_zone_of(g.longitude), false);
+    EXPECT(utm_zone_of(g.longitude) == 50, "zone %d", utm_zone_of(g.longitude));
+    EXPECT(std::abs(en[0] - 196900.08032304232) < 1e-3 && std::abs(en[1] - 2501983.224301045) < 1e-3 &&
+               std::abs(g.height - 85.81369735362543) < 1e-3,
+           "UTM origin %.4f %.4f %.4f", en[0], en[1], g.height);
+    int zone = 0;
+    bool south = false;
+    parse_pose_crs("EPSG:32749", zone, south);
+    EXPECT(zone == 49 && south, "parse EPSG:32749");
+    parse_pose_crs("none", zone, south);
+    EXPECT(zone == -1, "parse none");
+    std::printf("geo: UTM origin %.4f %.4f h %.4f\n", en[0], en[1], g.height);
+}
+
+void test_undistort()
+{
+    // 去畸变后的针孔像素 = 该像素中心对应的视线经原始相机（camera.hpp 的 OPENCV 投影公式）落入的原始像素。
+    View pin;
+    pin.width = 240;
+    pin.height = 160;
+    pin.model = "PINHOLE";
+    pin.model_id = 1;
+    pin.params = {200, 205, 121.3, 79.6};
+    pin.r_wc = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    pin.raw_model_id = 4;
+    pin.raw_params = {200, 205, 121.3, 79.6, -0.12, 0.03, 0.002, -0.001};
+    View raw = pin;
+    raw.model = "OPENCV";
+    raw.model_id = 4;
+    raw.params = pin.raw_params;
+    raw.raw_model_id = -1;
+    cv::Mat classes(pin.height, pin.width, CV_8U);
+    for (int y = 0; y < pin.height; ++y)
+    {
+        for (int x = 0; x < pin.width; ++x)
+        {
+            classes.at<std::uint8_t>(y, x) = static_cast<std::uint8_t>((x * 7 + y * 13) % 251);
+        }
+    }
+    const cv::Mat out = undistort_nearest(pin, classes);
+    std::size_t checked = 0, wrong = 0;
+    for (int y = 0; y < pin.height; ++y)
+    {
+        for (int x = 0; x < pin.width; ++x)
+        {
+            // 针孔像素中心 -> 归一化视线（深度 1）-> 原始相机投影。
+            const double point[3] = {(x + .5 - pin.params[2]) / pin.params[0], (y + .5 - pin.params[3]) / pin.params[1], 1.0};
+            double u = 0, v = 0;
+            project_point(raw, point, u, v);
+            const double sx = std::floor(u), sy = std::floor(v);
+            const bool inside = sx >= 0 && sy >= 0 && sx < pin.width && sy < pin.height;
+            const int want = inside ? classes.at<std::uint8_t>(static_cast<int>(sy), static_cast<int>(sx)) : 0;
+            ++checked;
+            if (out.at<std::uint8_t>(y, x) != want)
+            {
+                ++wrong;
+            }
+        }
+    }
+    EXPECT(wrong == 0, "undistort_nearest: %zu of %zu pixels differ from the OPENCV projection", wrong, checked);
+    std::printf("undistort: %zu pixels match the OPENCV projection\n", checked - wrong);
+}
+
 } // namespace
 
 int main()
@@ -293,6 +362,8 @@ int main()
     test_posix_paths();
     test_npz_round_trip();
     test_shore_level();
+    test_geo();
+    test_undistort();
     if (g_failures)
     {
         std::printf("%d check(s) FAILED\n", g_failures);

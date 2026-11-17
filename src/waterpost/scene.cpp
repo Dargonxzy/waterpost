@@ -4,6 +4,7 @@
 
 #include "error.hpp"
 #include "fs_util.hpp"
+#include "geo.hpp"
 #include "json_util.hpp"
 #include "lod.hpp"
 #include "masks.hpp"
@@ -196,7 +197,7 @@ std::vector<View> input_views(const Config& config, const std::vector<std::strin
 {
     if (config.mode == "poses")
     {
-        return read_pose_views(config.poses, config.mask_dir);
+        return read_pose_views(config);
     }
     std::map<std::string, View> unique;
     for (const std::string& name : blocks)
@@ -322,62 +323,174 @@ const SceneBlock* Scene::block(const std::string& name) const
     return nullptr;
 }
 
-std::vector<View> read_pose_views(const std::filesystem::path& path, const std::filesystem::path& mask_dir)
+namespace
 {
-    if (path.empty())
+
+std::string lower_ascii(std::string text)
+{
+    for (char& c : text)
     {
-        fail_value("--poses is required in poses mode");
+        c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
     }
-    const Json root = read_json_file(path);
-    std::map<std::string, PoseCamera> cameras;
-    if (root.contains("cameras"))
+    return text;
+}
+
+// 图像名拆成路径分量（反斜杠当斜杠，去掉空分量；UNC 的 //server/share 也一样拆开）。
+std::vector<std::string> name_components(const std::string& name)
+{
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : name)
     {
-        const Json& list = root.at("cameras");
-        if (list.is_array())
+        if (c == '/' || c == '\\')
         {
-            for (const Json& item : list)
+            if (!current.empty())
             {
-                cameras[std::to_string(jint(item.at("id")))] = pose_camera(item);
+                parts.push_back(current);
             }
+            current.clear();
         }
         else
         {
-            for (auto it = list.begin(); it != list.end(); ++it)
-            {
-                cameras[it.key()] = pose_camera(it.value());
-            }
+            current += c;
         }
     }
-    std::map<std::string, View> unique;
-    std::size_t missing = 0, index = 0;
-    for (const Json& image : root.at("images"))
+    if (!current.empty())
     {
-        ++index;
+        parts.push_back(current);
+    }
+    return parts;
+}
+
+// 去掉前 skip 个分量后的相对路径，扩展名换成 .png，接到 mask_dir 后面。
+std::filesystem::path mask_under(const std::filesystem::path& mask_dir, const std::vector<std::string>& parts, std::size_t skip)
+{
+    std::filesystem::path result = mask_dir;
+    for (std::size_t k = skip; k < parts.size(); ++k)
+    {
+        if (parts[k] == "..")
+        {
+            fail_value("Image name must not contain '..'");
+        }
+        result /= utf8_path(parts[k]);
+    }
+    result.replace_extension(".png");
+    return result;
+}
+
+bool is_absolute_name(const std::string& name)
+{
+    return !name.empty() && (name[0] == '/' || name[0] == '\\' || (name.size() > 1 && name[1] == ':'));
+}
+
+int distortion_model(const std::string& model)
+{
+    if (model == "SIMPLE_RADIAL") return 2;
+    if (model == "RADIAL") return 3;
+    if (model == "OPENCV") return 4;
+    if (model == "FULL_OPENCV") return 6;
+    return -1;
+}
+
+} // namespace
+
+std::vector<View> read_pose_views(const Config& config)
+{
+    // 1) 位姿文件：--poses（cameras 与 images 在同一个 JSON）或 --cameras + --images（两个文件）。
+    Json cameras_json = Json::object(), images_json;
+    std::string source;
+    if (!config.poses.empty())
+    {
+        const Json root = read_json_file(config.poses);
+        if (root.contains("cameras"))
+        {
+            cameras_json = root.at("cameras");
+        }
+        images_json = root.at("images");
+        source = path_utf8(config.poses);
+    }
+    else if (!config.cameras.empty() && !config.images.empty())
+    {
+        cameras_json = read_json_file(config.cameras);
+        images_json = read_json_file(config.images);
+        if (cameras_json.is_object() && cameras_json.contains("cameras"))
+        {
+            cameras_json = Json(cameras_json.at("cameras"));
+        }
+        if (images_json.is_object() && images_json.contains("images"))
+        {
+            images_json = Json(images_json.at("images"));
+        }
+        source = path_utf8(config.images);
+    }
+    else
+    {
+        fail_value("poses mode needs --poses FILE, or --cameras FILE with --images FILE");
+    }
+    std::map<std::string, PoseCamera> cameras;
+    if (cameras_json.is_array())
+    {
+        for (const Json& item : cameras_json)
+        {
+            cameras[std::to_string(jint(item.at("id")))] = pose_camera(item);
+        }
+    }
+    else
+    {
+        for (auto it = cameras_json.begin(); it != cameras_json.end(); ++it)
+        {
+            cameras[it.key()] = pose_camera(it.value());
+        }
+    }
+    // 图像：数组（id 字段或序号）或以 id 为键的对象。
+    std::vector<std::pair<long long, const Json*>> entries;
+    if (images_json.is_array())
+    {
+        long long index = 0;
+        for (const Json& item : images_json)
+        {
+            ++index;
+            entries.emplace_back(item.contains("id") ? jint(item.at("id")) : index, &item);
+        }
+    }
+    else
+    {
+        for (auto it = images_json.begin(); it != images_json.end(); ++it)
+        {
+            entries.emplace_back(std::stoll(it.key()), &it.value());
+        }
+    }
+
+    // 2) 逐张建视图（掩码稍后定）。
+    std::vector<View> parsed;
+    parsed.reserve(entries.size());
+    std::size_t distorted = 0;
+    for (const auto& [id, item] : entries)
+    {
+        const Json& image = *item;
         View view;
         view.name = image.at("name").get<std::string>();
-        view.image_id = static_cast<std::uint32_t>(image.contains("id") ? jint(image.at("id")) : static_cast<long long>(index));
+        view.image_id = static_cast<std::uint32_t>(id);
         PoseCamera camera;
         if (image.contains("camera"))
         {
             camera = pose_camera(image.at("camera"));
-            view.camera_id = 0;
         }
         else
         {
-            const std::string id = std::to_string(jint(image.at("camera_id")));
-            const auto found = cameras.find(id);
+            const std::string cid = std::to_string(jint(image.at("camera_id")));
+            const auto found = cameras.find(cid);
             if (found == cameras.end())
             {
-                fail_value("Pose file: image " + view.name + " references missing camera " + id);
+                fail_value("Pose file: image " + view.name + " references missing camera " + cid);
             }
             camera = found->second;
-            view.camera_id = static_cast<std::uint32_t>(std::stoul(id));
+            view.camera_id = static_cast<std::uint32_t>(std::stoul(cid));
         }
-        view.model = camera.model;
-        view.model_id = model_id_of(camera.model);
+        const int model_id = model_id_of(camera.model);
         {
             static const int counts[] = {3, 4, 4, 5, 8, 8, 12, 5, 4, 5, 12};
-            const std::size_t expected = static_cast<std::size_t>(counts[view.model_id]);
+            const std::size_t expected = static_cast<std::size_t>(counts[model_id]);
             if (camera.params.size() != expected)
             {
                 fail_value("Pose file: camera of image " + view.name + " (" + camera.model + ") needs " +
@@ -390,13 +503,45 @@ std::vector<View> read_pose_views(const std::filesystem::path& path, const std::
         }
         view.width = camera.width;
         view.height = camera.height;
-        view.params = camera.params;
-        // 世界到相机：cam = R * p + t。
-        if (image.contains("qvec"))
+        const int raw = distortion_model(camera.model);
+        if (raw >= 0)
         {
-            const Json& q = image.at("qvec");
+            // 带畸变：投影用内参不变的针孔相机，原始相机留着给读掩码时去畸变；畸变系数全 0 时就是针孔。
+            const std::size_t first = raw == 2 || raw == 3 ? 3 : 4;
+            bool any = false;
+            for (std::size_t k = first; k < camera.params.size(); ++k)
+            {
+                any |= camera.params[k] != 0;
+            }
+            double fx, fy, cx, cy;
+            raw_intrinsics(raw, camera.params, fx, fy, cx, cy);
+            view.model = "PINHOLE";
+            view.model_id = 1;
+            view.params = {fx, fy, cx, cy};
+            if (any)
+            {
+                view.raw_model_id = raw;
+                view.raw_params = camera.params;
+                ++distorted;
+            }
+        }
+        else if (model_id == 0 || model_id == 1)
+        {
+            view.model = camera.model;
+            view.model_id = model_id;
+            view.params = camera.params;
+        }
+        else
+        {
+            fail_value("Pose file: camera model " + camera.model + " of image " + view.name +
+                       " is not supported (fisheye models need their own undistortion)");
+        }
+        // 世界到相机：cam = R * p + t。
+        if (image.contains("qvec") || image.contains("q"))
+        {
+            const Json& q = image.contains("qvec") ? image.at("qvec") : image.at("q");
             view.r_wc = qvec_to_rotmat({jnum(q.at(0)), jnum(q.at(1)), jnum(q.at(2)), jnum(q.at(3))});
-            view.t_wc = vector3(image.at("tvec"));
+            view.t_wc = vector3(image.contains("tvec") ? image.at("tvec") : image.at("t"));
         }
         else if (image.contains("camera_to_world"))
         {
@@ -441,7 +586,7 @@ std::vector<View> read_pose_views(const std::filesystem::path& path, const std::
         }
         else
         {
-            fail_value("Pose file: image " + view.name + " needs qvec+tvec, R+t, R+center or camera_to_world");
+            fail_value("Pose file: image " + view.name + " needs q(vec)+t(vec), R+t, R+center or camera_to_world");
         }
         for (std::size_t i = 0; i < 3; ++i)
         {
@@ -451,23 +596,163 @@ std::vector<View> read_pose_views(const std::filesystem::path& path, const std::
         if (image.contains("mask"))
         {
             const std::filesystem::path mask = utf8_path(image.at("mask").get<std::string>());
-            view.mask_path = mask.is_absolute() ? mask : mask_dir / mask;
+            view.mask_path = mask.is_absolute() ? mask : config.mask_dir / mask;
         }
-        else
+        parsed.push_back(std::move(view));
+    }
+    if (distorted)
+    {
+        log("[POSES] %zu of %zu images use a distorted camera: masks are undistorted to the pinhole camera when read",
+            distorted, parsed.size());
+    }
+
+    // 3) 坐标系：位姿是投影坐标（UTM）时换到 LOD 本地坐标。本地原点 = LOD 根节点 transform 的平移（ECEF）。
+    {
+        int zone = 0;
+        bool south = false;
+        parse_pose_crs(config.pose_crs, zone, south);
+        if (zone == 0)
         {
-            view.mask_path = semantic_mask_path(mask_dir, view.name);
+            std::vector<double> magnitude;
+            for (const View& view : parsed)
+            {
+                magnitude.push_back(std::max(std::abs(view.center[0]), std::abs(view.center[1])));
+            }
+            zone = !magnitude.empty() && median(magnitude) > 1e5 ? 0 : -1; // 明显不是本地坐标才换算
+            if (zone == 0)
+            {
+                log("[POSES] camera centres look like projected coordinates; converting with the LOD georeference "
+                    "(pass --pose-crs none if they are already local)");
+            }
+        }
+        if (zone != -1)
+        {
+            std::array<double, 16> m{};
+            if (!read_lod_root_transform(config.lod, m))
+            {
+                fail_value("--pose-crs needs the LOD root transform (local -> ECEF), but " + path_utf8(config.lod) +
+                           " has none; pass --pose-crs none if the poses are already in LOD coordinates");
+            }
+            const Geodetic origin = ecef_to_geodetic(m[12], m[13], m[14]);
+            if (zone == 0)
+            {
+                zone = utm_zone_of(origin.longitude);
+                south = origin.latitude < 0;
+            }
+            const std::array<double, 2> en = utm_forward(origin.latitude, origin.longitude, zone, south);
+            const double offset[3] = {en[0], en[1], origin.height};
+            for (View& view : parsed)
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    view.center[static_cast<std::size_t>(k)] -= offset[k];
+                }
+                for (std::size_t r = 0; r < 3; ++r)
+                {
+                    view.t_wc[r] = -(view.r_wc[3 * r] * view.center[0] + view.r_wc[3 * r + 1] * view.center[1] +
+                                     view.r_wc[3 * r + 2] * view.center[2]);
+                }
+            }
+            log("[POSES] UTM zone %d%s: LOD origin (lon %.7f, lat %.7f, h %.3f) = E %.3f N %.3f; poses shifted to LOD coordinates",
+                zone, south ? "S" : "N", origin.longitude * 180 / M_PI, origin.latitude * 180 / M_PI, origin.height, en[0], en[1]);
+        }
+    }
+
+    // 4) 掩码：<mask-dir>/<图像名去掉前 k 级目录，扩展名换 .png>。--image-root 给了就去掉这个前缀；
+    //    没给时用前几张图自动找 k（从 0 起，第一个能在掩码目录下找到文件的级数），之后所有图用同一个 k。
+    std::size_t skip = 0;
+    bool skip_known = false;
+    std::vector<std::string> root_parts;
+    if (!config.image_root.empty())
+    {
+        root_parts = name_components(config.image_root);
+    }
+    else
+    {
+        std::size_t tried = 0;
+        for (const View& view : parsed)
+        {
+            if (!view.mask_path.empty())
+            {
+                continue;
+            }
+            const std::vector<std::string> parts = name_components(view.name);
+            for (std::size_t k = 0; k + 1 <= parts.size() && !skip_known; ++k)
+            {
+                if (std::filesystem::is_regular_file(mask_under(config.mask_dir, parts, k)))
+                {
+                    skip = k;
+                    skip_known = true;
+                }
+            }
+            if (skip_known || ++tried >= 50)
+            {
+                break;
+            }
+        }
+        if (!skip_known)
+        {
+            for (const View& view : parsed)
+            {
+                if (view.mask_path.empty())
+                {
+                    fail_value("No mask found under " + path_utf8(config.mask_dir) + " for image " + view.name +
+                               " (tried every leading-folder cut); check --mask-dir or pass --image-root");
+                }
+            }
+        }
+    }
+    std::map<std::string, View> unique;
+    std::unordered_map<std::string, std::string> owner;
+    std::size_t missing = 0;
+    std::string example;
+    for (View& view : parsed)
+    {
+        if (view.mask_path.empty())
+        {
+            std::vector<std::string> parts = name_components(view.name);
+            std::size_t cut = skip;
+            if (!root_parts.empty())
+            {
+                bool match = parts.size() > root_parts.size();
+                for (std::size_t k = 0; match && k < root_parts.size(); ++k)
+                {
+                    match = lower_ascii(parts[k]) == lower_ascii(root_parts[k]);
+                }
+                if (!match)
+                {
+                    fail_value("Image " + view.name + " does not start with --image-root " + config.image_root);
+                }
+                cut = root_parts.size();
+            }
+            else if (!skip_known && is_absolute_name(view.name))
+            {
+                fail_value("Image name is an absolute path; pass --image-root: " + view.name);
+            }
+            view.mask_path = mask_under(config.mask_dir, parts, std::min(cut, parts.size() - 1));
         }
         if (!std::filesystem::is_regular_file(view.mask_path))
         {
+            example = example.empty() ? path_utf8(view.mask_path) : example;
             ++missing;
             continue;
         }
         view.mask_key = canonical_key(view.mask_path);
+        const auto [it, inserted] = owner.emplace(view.mask_key, view.name);
+        if (!inserted)
+        {
+            fail_value("Images " + it->second + " and " + view.name + " map to the same mask " + path_utf8(view.mask_path));
+        }
         unique.emplace(view.key(), std::move(view));
+    }
+    if (!root_parts.empty() || skip_known)
+    {
+        log("[POSES] masks: <mask-dir>/<image name without its first %zu folder(s)>.png",
+            root_parts.empty() ? skip : root_parts.size());
     }
     if (missing)
     {
-        log("[VIEW] %zu posed views without a semantic mask are ignored", missing);
+        log("[VIEW] %zu posed views without a semantic mask are ignored (e.g. %s)", missing, example.c_str());
     }
     std::vector<View> views;
     for (auto& [key, view] : unique)
@@ -476,7 +761,36 @@ std::vector<View> read_pose_views(const std::filesystem::path& path, const std::
     }
     if (views.size() < 3)
     {
-        fail_value("Back-projection requires at least three semantic camera views in " + path_utf8(path));
+        fail_value("Back-projection requires at least three semantic camera views in " + source);
+    }
+
+    // 5) 检查：相机应在 LOD 附近（坐标系弄错时这里就能发现）。
+    if (!config.lod.empty() && std::filesystem::is_regular_file(config.lod / "tileset.json"))
+    {
+        Box3 extent;
+        for (const LodBlock& block : read_lod_index(config.lod).blocks)
+        {
+            for (const LodLeaf& leaf : block.leaves)
+            {
+                extent.expand(leaf.box);
+            }
+        }
+        if (extent.valid())
+        {
+            const double size = std::max({extent.maximum[0] - extent.minimum[0], extent.maximum[1] - extent.minimum[1], 1000.0});
+            std::size_t near = 0;
+            for (const View& view : views)
+            {
+                near += view.center[0] > extent.minimum[0] - size && view.center[0] < extent.maximum[0] + size &&
+                        view.center[1] > extent.minimum[1] - size && view.center[1] < extent.maximum[1] + size;
+            }
+            if (near * 2 < views.size())
+            {
+                fail_value("Only " + std::to_string(near) + " of " + std::to_string(views.size()) +
+                           " cameras are near the LOD; the poses and the LOD are in different coordinate systems "
+                           "(check --pose-crs)");
+            }
+        }
     }
     return views;
 }

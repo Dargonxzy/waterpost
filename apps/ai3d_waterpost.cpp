@@ -62,12 +62,16 @@ std::vector<std::string> arguments(int argc, char** argv)
 
 const char* HELP =
     "usage: ai3d_waterpost <stage> --work DIR [options]\n"
-    "       ai3d_waterpost evaluate (--project DIR | --poses FILE --mask-dir DIR --images DIR) --out CSV\n"
+    "       ai3d_waterpost evaluate (--project DIR | (--poses FILE | --cameras FILE --images FILE) --mask-dir DIR)\n"
+    "                               [--photos DIR] [--image-root PREFIX] [--pose-crs auto|none|EPSG:326NN] --out CSV\n"
     "                               --variant name=LOD [--variant ...] [--step N] [--views a.jpg,b.jpg] [--gpu-id N]\n"
     "stages: all split assign scene detect reconcile candidates active samples model write finalize\n"
     "  --mode blocks|poses  blocks: cameras/blocks from <project>/artifacts/blocks; poses: LOD + --poses JSON\n"
     "  --project DIR        task directory (artifacts/blocks, bbox.json); required in blocks mode\n"
-    "  --poses FILE         camera pose JSON (poses mode)\n"
+    "  --poses FILE         camera pose JSON with cameras and images (poses mode)\n"
+    "  --cameras FILE --images FILE  or cameras / images in two JSON files (objects keyed by id, or arrays)\n"
+    "  --image-root PREFIX  mask = <mask-dir>/<image name without PREFIX>.png (default: found automatically)\n"
+    "  --pose-crs auto|none|EPSG:326NN  poses in UTM are shifted into LOD coordinates via the LOD root transform\n"
     "  --bbox FILE --roi FILE  fill domain in poses mode (default: LOD extent, no ROI)\n"
     "  --view-margin X      poses: camera XY may lie X * block size outside the block (default 0.5)\n"
     "  --min-view-leaves N  poses: a view belongs to a block if it sees >= N finest leaves (default 1)\n"
@@ -103,10 +107,11 @@ int main(int argc, char** argv)
     const std::string stage = args[0];
     if (stage == "evaluate")
     {
-        // evaluate --project P --images DIR [--mask-dir M] --out CSV [--step N] --variant name=LOD ...
+        // evaluate (--project P | --poses F | --cameras C --images I) [--photos DIR] [--mask-dir M] --out CSV --variant name=LOD ...
         try
         {
-            std::filesystem::path project, images, masks, csv, poses;
+            std::filesystem::path project, images, masks, csv, poses, cameras, image_list;
+            std::string image_root, pose_crs = "auto";
             int step = 10, gpu = 0, water_class = 9;
             std::vector<std::pair<std::string, std::filesystem::path>> variants;
             std::vector<std::string> only;
@@ -115,7 +120,16 @@ int main(int argc, char** argv)
                 const std::string& key = args[i];
                 const std::string& value = args[i + 1];
                 if (key == "--project") project = utf8_path(value);
-                else if (key == "--images") images = utf8_path(value);
+                else if (key == "--photos") images = utf8_path(value);
+                else if (key == "--images")
+                {
+                    // 与主流程一致：--images 是 images.json；给的是目录时按旧用法当照片目录。
+                    if (std::filesystem::is_directory(utf8_path(value))) images = utf8_path(value);
+                    else image_list = utf8_path(value);
+                }
+                else if (key == "--cameras") cameras = utf8_path(value);
+                else if (key == "--image-root") image_root = value;
+                else if (key == "--pose-crs") pose_crs = value;
                 else if (key == "--mask-dir") masks = utf8_path(value);
                 else if (key == "--poses") poses = utf8_path(value);
                 else if (key == "--out") csv = utf8_path(value);
@@ -145,7 +159,20 @@ int main(int argc, char** argv)
             }
             if (masks.empty()) masks = project / ".temp" / "semantic" / "masks";
             if (images.empty()) images = project / ".temp" / "undistortion" / "images";
-            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only, poses);
+            Config pose_config;
+            const bool posed = !poses.empty() || !cameras.empty() || !image_list.empty();
+            if (posed)
+            {
+                if (variants.empty()) fail_value("evaluate needs at least one --variant");
+                pose_config.poses = poses;
+                pose_config.cameras = cameras;
+                pose_config.images = image_list;
+                pose_config.image_root = image_root;
+                pose_config.pose_crs = pose_crs;
+                pose_config.mask_dir = masks;
+                pose_config.lod = variants.front().second; // 坐标换算与检查用第一个 LOD 的地理参考
+            }
+            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only, posed ? &pose_config : nullptr);
             return 0;
         }
         catch (const std::exception& error)
@@ -166,6 +193,7 @@ int main(int argc, char** argv)
         Config config;
         std::vector<std::string> tiles;
         std::string project, lod, masks, work, output, mode, poses, bbox, roi, list, split = "interleave";
+        std::string cameras, images, image_root, pose_crs;
         int threads = -1, gpu = -1, parts = 0;
         bool debug = false, link = false;
         std::vector<std::pair<std::string, std::string>> overrides;
@@ -186,6 +214,10 @@ int main(int argc, char** argv)
             else if (key == "--output") output = value();
             else if (key == "--mode") mode = value();
             else if (key == "--poses") poses = value();
+            else if (key == "--cameras") cameras = value();
+            else if (key == "--images") images = value();
+            else if (key == "--image-root") image_root = value();
+            else if (key == "--pose-crs") pose_crs = value();
             else if (key == "--bbox") bbox = value();
             else if (key == "--roi") roi = value();
             else if (key == "--list") list = value();
@@ -231,9 +263,9 @@ int main(int argc, char** argv)
             {
                 fail_value("--project is required for the first run in blocks mode");
             }
-            if (config.mode == "poses" && poses.empty())
+            if (config.mode == "poses" && poses.empty() && (cameras.empty() || images.empty()))
             {
-                fail_value("--poses is required for the first split/assign/all run in poses mode");
+                fail_value("poses mode needs --poses FILE, or --cameras FILE with --images FILE, on the first run");
             }
             if (project.empty() && (lod.empty() || masks.empty()))
             {
@@ -266,10 +298,24 @@ int main(int argc, char** argv)
                 fail_value("--mode " + mode + " differs from config.json (" + config.mode + "); use a new --work directory");
             }
             if (!config.poses.empty()) check(poses, config.poses, "--poses");
+            if (!config.cameras.empty()) check(cameras, config.cameras, "--cameras");
+            if (!config.images.empty()) check(images, config.images, "--images");
+            if (!image_root.empty() && !config.image_root.empty() && image_root != config.image_root)
+            {
+                fail_value("--image-root differs from config.json; use a new --work directory");
+            }
+            if (!pose_crs.empty() && pose_crs != config.pose_crs)
+            {
+                fail_value("--pose-crs differs from config.json (" + config.pose_crs + "); use a new --work directory");
+            }
             if (!config.bbox.empty()) check(bbox, config.bbox, "--bbox");
             if (!config.roi.empty()) check(roi, config.roi, "--roi");
         }
         if (!poses.empty()) config.poses = std::filesystem::absolute(utf8_path(poses));
+        if (!cameras.empty()) config.cameras = std::filesystem::absolute(utf8_path(cameras));
+        if (!images.empty()) config.images = std::filesystem::absolute(utf8_path(images));
+        if (!image_root.empty()) config.image_root = image_root;
+        if (!pose_crs.empty()) config.pose_crs = pose_crs;
         if (!bbox.empty()) config.bbox = std::filesystem::absolute(utf8_path(bbox));
         if (!roi.empty()) config.roi = std::filesystem::absolute(utf8_path(roi));
         if (!output.empty())

@@ -63,7 +63,8 @@ const std::unordered_map<std::string, Occupancy>& scene_occupancy(const Config& 
 // 输入里参与处理的块（scene 之前用）：blocks 模式为工程块清单 ∩ LOD 块，poses 模式为 LOD 块。
 std::vector<std::string> input_blocks(const Config& config);
 
-// 位姿 JSON（poses 模式）读成视图；没有掩码的视图跳过。格式见 README。
-std::vector<View> read_pose_views(const std::filesystem::path& path, const std::filesystem::path& mask_dir);
+// 位姿（poses 模式）读成视图：--poses（单个 JSON）或 --cameras + --images（两个 JSON）；畸变相机换成针孔并记下
+// 原始相机；投影坐标按 --pose-crs 换到 LOD 本地坐标；掩码按 --mask-dir / --image-root 找，没有掩码的视图跳过。
+std::vector<View> read_pose_views(const Config& config);
 
 } // namespace ai3d::waterpost

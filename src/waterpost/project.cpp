@@ -375,6 +375,11 @@ Json view_record(const View& view)
     record["center"] = view.center;
     record["mask_path"] = path_utf8(view.mask_path);
     record["mask_key"] = view.mask_key;
+    if (view.distorted())
+    {
+        record["raw_model_id"] = view.raw_model_id;
+        record["raw_params"] = view.raw_params;
+    }
     return record;
 }
 
@@ -403,6 +408,14 @@ View view_from_record(const Json& record)
     }
     view.mask_path = utf8_path(record.at("mask_path").get<std::string>());
     view.mask_key = record.at("mask_key").get<std::string>();
+    if (record.contains("raw_model_id"))
+    {
+        view.raw_model_id = record.at("raw_model_id").get<int>();
+        for (const Json& p : record.at("raw_params"))
+        {
+            view.raw_params.push_back(jnum(p));
+        }
+    }
     return view;
 }
 
@@ -416,6 +429,10 @@ Json config_to_json(const Config& c)
     v["output"] = path_utf8(c.output);
     v["mode"] = c.mode;
     v["poses"] = path_utf8(c.poses);
+    v["cameras"] = path_utf8(c.cameras);
+    v["images"] = path_utf8(c.images);
+    v["image_root"] = c.image_root;
+    v["pose_crs"] = c.pose_crs;
     v["bbox"] = path_utf8(c.bbox);
     v["roi"] = path_utf8(c.roi);
     v["view_margin"] = c.view_margin;
@@ -458,6 +475,10 @@ Config config_from_json(const Json& v)
     c.output = utf8_path(v.value("output", std::string()));
     c.mode = v.value("mode", std::string("blocks"));
     c.poses = utf8_path(v.value("poses", std::string()));
+    c.cameras = utf8_path(v.value("cameras", std::string()));
+    c.images = utf8_path(v.value("images", std::string()));
+    c.image_root = v.value("image_root", std::string());
+    c.pose_crs = v.value("pose_crs", std::string("auto"));
     c.bbox = utf8_path(v.value("bbox", std::string()));
     c.roi = utf8_path(v.value("roi", std::string()));
     c.view_margin = v.contains("view_margin") ? jnum(v.at("view_margin")) : 0.5;

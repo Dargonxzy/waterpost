@@ -275,6 +275,29 @@ const LodBlock* LodIndex::block(const std::string& name) const
     return nullptr;
 }
 
+bool read_lod_root_transform(const std::filesystem::path& root, std::array<double, 16>& transform)
+{
+    for (const char* name : {"tileset.source.json", "tileset.json"})
+    {
+        const std::filesystem::path path = root / name;
+        if (!std::filesystem::is_regular_file(path))
+        {
+            continue;
+        }
+        const Json tileset = read_json_file(path);
+        const Json& node = tileset.at("root");
+        if (node.contains("transform") && node["transform"].is_array() && node["transform"].size() == 16)
+        {
+            for (std::size_t k = 0; k < 16; ++k)
+            {
+                transform[k] = jnum(node["transform"][k]);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 LodIndex read_lod_index(const std::filesystem::path& root)
 {
     LodIndex index;

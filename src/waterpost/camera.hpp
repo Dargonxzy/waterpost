@@ -31,12 +31,74 @@ struct View
     // canonical_mask_path(mask_path)。
     std::string mask_key;
     double water_ratio = 0.0;
+    // 原始相机带畸变时（位姿文件给的 SIMPLE_RADIAL / RADIAL / OPENCV / FULL_OPENCV）：上面的 model / params 是
+    // 去畸变后的针孔相机（内参不变），所有投影都用它；raw_* 是原始相机，只在读掩码 / 照片时用来去畸变。
+    int raw_model_id = -1;
+    std::vector<double> raw_params;
 
     // name 里的反斜杠换成正斜杠。
     std::string key() const;
     // 模型无畸变（针孔），可以用投影后的凸包做批量裁剪。
     bool pinhole() const;
+    // 掩码 / 照片是在带畸变的原始相机下拍的，读入后要先去畸变。
+    bool distorted() const
+    {
+        return raw_model_id >= 0;
+    }
 };
+
+// 原始相机的畸变：归一化坐标 (x, y) -> 畸变后的归一化坐标；返回 false 表示模型不支持。
+// 公式与 COLMAP 相同（FULL_OPENCV 含 k3..k6 有理项）。
+inline bool distort_normalized(int model_id, const std::vector<double>& p, double x, double y, double& xd, double& yd)
+{
+    const double r2 = x * x + y * y;
+    switch (model_id)
+    {
+    case 2: // SIMPLE_RADIAL: f, cx, cy, k
+        xd = x * (1 + p[3] * r2);
+        yd = y * (1 + p[3] * r2);
+        return true;
+    case 3: // RADIAL: f, cx, cy, k1, k2
+    {
+        const double radial = 1 + p[3] * r2 + p[4] * r2 * r2;
+        xd = x * radial;
+        yd = y * radial;
+        return true;
+    }
+    case 4: // OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+    case 6: // FULL_OPENCV: ... k3, k4, k5, k6
+    {
+        double radial = 1 + p[4] * r2 + p[5] * r2 * r2;
+        if (model_id == 6)
+        {
+            radial = (radial + p[8] * r2 * r2 * r2) / (1 + p[9] * r2 + p[10] * r2 * r2 + p[11] * r2 * r2 * r2);
+        }
+        xd = x * radial + 2 * p[6] * x * y + p[7] * (r2 + 2 * x * x);
+        yd = y * radial + p[6] * (r2 + 2 * y * y) + 2 * p[7] * x * y;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// 原始相机的焦距与主点（SIMPLE_RADIAL / RADIAL 的 f 同时作 fx、fy）。
+inline void raw_intrinsics(int model_id, const std::vector<double>& p, double& fx, double& fy, double& cx, double& cy)
+{
+    if (model_id == 2 || model_id == 3)
+    {
+        fx = fy = p[0];
+        cx = p[1];
+        cy = p[2];
+    }
+    else
+    {
+        fx = p[0];
+        fy = p[1];
+        cx = p[2];
+        cy = p[3];
+    }
+}
 
 // 投影一个点：深度 > 1e-6 时返回 true 并给出像素坐标 (u, v)。
 inline bool project_point(const View& view, const double* point, double& u, double& v);

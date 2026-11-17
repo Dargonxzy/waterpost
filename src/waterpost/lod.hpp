@@ -10,6 +10,7 @@
 #include "json_util.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -49,6 +50,9 @@ struct LodIndex
 };
 
 LodIndex read_lod_index(const std::filesystem::path& root);
+
+// 根节点的 transform（列主序 4x4，本地 -> ECEF）；没有时返回 false。
+bool read_lod_root_transform(const std::filesystem::path& root, std::array<double, 16>& transform);
 
 // 一个叶节点 bin 的原始记录（去掉末尾补齐记录）。
 struct LeafContent
