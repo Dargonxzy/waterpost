@@ -21,6 +21,9 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path);
 
 std::string read_file_text(const std::filesystem::path& path);
 
+// Copy bytes without chmod/sendfile, which object-storage FUSE mounts may reject.
+void copy_file_contents(const std::filesystem::path& source, const std::filesystem::path& target);
+
 // 先写 temporary 再 rename 到 path；失败时删除临时文件并抛错。
 void write_file_atomic(const std::filesystem::path& path, const void* data, std::size_t size,
                        const std::filesystem::path& temporary);

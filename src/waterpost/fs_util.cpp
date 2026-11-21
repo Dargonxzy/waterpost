@@ -58,6 +58,36 @@ std::string read_file_text(const std::filesystem::path& path)
     return std::string(bytes.begin(), bytes.end());
 }
 
+void copy_file_contents(const std::filesystem::path& source, const std::filesystem::path& target)
+{
+    std::ifstream input(source, std::ios::binary);
+    if (!input)
+    {
+        fail_missing("Cannot open copy source: " + path_utf8(source));
+    }
+    std::ofstream output(target, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        fail_runtime("Cannot open copy target: " + path_utf8(target));
+    }
+    std::vector<char> buffer(1 << 20);
+    while (input.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || input.gcount())
+    {
+        output.write(buffer.data(), input.gcount());
+        if (!output)
+        {
+            break;
+        }
+    }
+    output.close();
+    if (input.bad() || !input.eof() || !output)
+    {
+        std::error_code ignored;
+        std::filesystem::remove(target, ignored);
+        fail_runtime("Copy failed: " + path_utf8(source) + " -> " + path_utf8(target));
+    }
+}
+
 void write_file_atomic(const std::filesystem::path& path, const void* data, std::size_t size,
                        const std::filesystem::path& temporary)
 {

@@ -3,7 +3,9 @@
 #include "error.hpp"
 #include "fs_util.hpp"
 
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -420,9 +422,13 @@ std::string dump_python(const Json& value, bool compact)
 
 void write_json_atomic(const std::filesystem::path& path, const Json& value, bool compact)
 {
+    // 分机阶段会同时保存 config.json；每次发布必须使用独立临时文件。
+    static const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    static std::atomic<std::uint64_t> sequence{0};
     const std::string text = dump_python(value, compact);
     std::filesystem::path temporary = path;
-    temporary += ".tmp";
+    temporary += "." + std::to_string(process_id()) + "." + std::to_string(nonce) + "." +
+                 std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
     write_file_atomic(path, text.data(), text.size(), temporary);
 }
 

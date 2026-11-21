@@ -22,6 +22,7 @@ ai3d_waterpost.exe all --project D:\data\滑梯_20261025183928 --work D:\data\�
 - 输入（`--project`、`--lod`、`--mask-dir`、`--mode`、`--poses`、`--bbox`、`--roi`）在第一次运行时写进 `work\config.json`，
   之后的阶段直接读；再传不同的值会报错（换一个新的 `--work`）。分机时各机器必须用**同一绝对路径**访问 work、LOD、掩码与位姿
   （视图以掩码的绝对路径为键），盘符不同就用统一的 UNC 路径；
+- 输入 LOD 在运行期间应保持不变。程序按 `--threads` 并行读取外部清单，并在每个进程内缓存索引，避免逐块重复扫描整个 LOD；
 - 可以往同一个 `--output` 重跑：finalize 会把上次改写、这次没改写的文件换回输入内容（按大小与修改时间判断），并删掉
   上次留下的 `_water<k>` 溢出节点；detect 重跑时先清掉本块上一次的交接文件。
 
@@ -126,3 +127,37 @@ write 阶段对每块最细层的剩余高斯做一次连通簇去噪：中心�
 - 没有掩码的视图直接跳过（不在这里调用语义分割）。
 
 构建：`powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1`（依赖与 ai3d-waterpre 相同）。
+
+## Linux / CUDA 12.8 编译与迁移
+
+`scripts/build_linux.sh` 使用独立的 Conda C++ 工具链和已有 CUDA 12.8 Toolkit。工具链固定 GCC 13、glibc 2.28
+sysroot，面向 Ubuntu 20.04 / 22.04 / 24.04 x86_64；不会要求目标电脑安装 Conda。源码旁需有
+`ai3d-core`、`ai3d-platform`、`ai3d-io`、`ai3d-gpu` 四个仓库。
+
+```bash
+# 在 WSL/Linux 中准备一次；不修改原来的 blockgs 环境。
+CONDA_OVERRIDE_GLIBC=2.28 conda env create \
+  -p "$HOME/.cache/ai3d-waterpost/build-env" \
+  -f scripts/linux-build-environment.yml
+
+# CUDA 12.8 也可以安装在其他目录，通过 --cuda-root 指定。
+bash scripts/build_linux.sh \
+  --prefix "$HOME/.cache/ai3d-waterpost/build-env" \
+  --cuda-root "$HOME/miniforge3/envs/blockgs"
+
+# 需 Python 3.9+、readelf、ldd、patchelf；patchelf 在上面的工具链里。
+PATH="$HOME/.cache/ai3d-waterpost/build-env/bin:$PATH" python3 scripts/package_linux.py \
+  --prefix "$HOME/.cache/ai3d-waterpost/build-env" \
+  --cuda-root "$HOME/miniforge3/envs/blockgs"
+```
+
+编译输出位于 `build/linux-cu128/bin/`。默认编入 SM 75、80、86、89、90、100、120 的原生代码及 compute_120 PTX，
+覆盖 RTX 40 系列；可用 `--archs` 覆盖。脚本会运行现有单元测试及实际 CUDA 内核测试，需要可用的 NVIDIA GPU。
+
+打包输出 `dist/ai3d-waterpost-linux-x86_64-cu128.tar.gz` 及 SHA256 校验文件。包内含可执行文件、动态库、
+CPU/GPU 检查工具、第三方许可证和构建信息；使用相对库路径，不依赖构建电脑的绝对路径。
+打包会检查所有 ELF 的 glibc 要求不高于 2.31，并验证库依赖闭合及脱离 Conda 后运行。已存在的包不会被覆盖；
+重新打包可用 `--output dist/<新包名>`。
+
+目标电脑应复制并解压整个包，运行 `./ai3d_waterpost --help`。无需 CUDA Toolkit，但需要 NVIDIA 驱动，
+建议 570.124.06 或更新；详细运行命令见 [Linux 运行说明](scripts/linux-runtime-README.md)。

@@ -7,6 +7,9 @@
 #include "shore.hpp"
 #include "geo.hpp"
 #include "masks.hpp"
+#include "fs_util.hpp"
+#include "json_util.hpp"
+#include "parallel.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -18,6 +21,11 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -356,14 +364,197 @@ void test_undistort()
 
 } // namespace
 
+void test_concurrent_json()
+{
+#ifndef _WIN32
+    using namespace ai3d::waterpost;
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("waterpost-json-" + std::to_string(process_id()));
+    const auto path = root / "config.json";
+    std::vector<pid_t> children;
+    for (int worker = 0; worker < 8; ++worker)
+    {
+        const pid_t child = fork();
+        if (child == 0)
+        {
+            try
+            {
+                for (int iteration = 0; iteration < 100; ++iteration)
+                {
+                    Json value = {{"worker", worker}, {"iteration", iteration},
+                                  {"payload", std::string(16384, 'a' + worker)}};
+                    write_json_atomic(path, value, false);
+                    const Json read = read_json_file(path);
+                    const int writer = read.at("worker").get<int>();
+                    if (writer < 0 || writer >= 8 ||
+                        read.at("payload").get<std::string>() != std::string(16384, 'a' + writer))
+                        _exit(2);
+                }
+                _exit(0);
+            }
+            catch (...) { _exit(3); }
+        }
+        EXPECT(child > 0, "fork failed");
+        if (child > 0) children.push_back(child);
+    }
+    for (const pid_t child : children)
+    {
+        int status = 0;
+        const auto waited = waitpid(child, &status, 0);
+        EXPECT(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "concurrent JSON writer failed: status %d", status);
+    }
+    std::size_t remaining = 0;
+    for (auto it = std::filesystem::directory_iterator(root); it != std::filesystem::directory_iterator(); ++it)
+        ++remaining;
+    EXPECT(remaining == 1, "temporary JSON files remain: %zu", remaining);
+    std::filesystem::remove_all(root);
+    std::printf("concurrent JSON: 8 processes, 800 atomic publications\n");
+#endif
+}
+
+void test_copy_contents()
+{
+    using namespace ai3d::waterpost;
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("waterpost-copy-" + std::to_string(process_id()));
+    std::filesystem::create_directories(root);
+    const auto source = root / "source.bin", target = root / "target.bin";
+    std::vector<std::uint8_t> payload((2 << 20) + 137);
+    for (std::size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<std::uint8_t>((i * 37 + i / 251) & 255);
+    write_file_atomic(source, payload.data(), payload.size(), root / "source.tmp");
+    copy_file_contents(source, target);
+    EXPECT(read_file_bytes(target) == payload, "multi-buffer binary copy changed bytes");
+    write_file_atomic(source, payload.data(), 0, root / "source.tmp");
+    copy_file_contents(source, target);
+    EXPECT(std::filesystem::file_size(target) == 0, "empty copy did not truncate target");
+    bool rejected = false;
+    try { copy_file_contents(root / "missing", target); }
+    catch (const std::exception&) { rejected = true; }
+    EXPECT(rejected, "copy accepted a missing source");
+    std::filesystem::remove_all(root);
+    std::printf("copy contents: binary, partial buffer, empty and missing source passed\n");
+}
+
+void test_empty_lod_leaf()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("waterpost-empty-leaf-" + std::to_string(process_id()));
+    Box3 box;
+    box.minimum = {133.0, -10.0, -35.0};
+    box.maximum = {157.0, 13.0, -18.0};
+    for (bool semantic : {false, true})
+    {
+        const auto path = root / (semantic ? "semantic.bin" : "plain.bin");
+        write_leaf(path, {}, 0, box, semantic);
+        const auto bytes = read_file_bytes(path);
+        const auto padded = read_leaf_padded(path);
+        EXPECT(padded == GSSP_PAD, "empty leaf must have one loadable page");
+        EXPECT(padded == padded_leaf_count(0), "empty leaf write metadata differs from BIN header");
+        EXPECT(bytes.size() == GSSP_HEADER + std::size_t{GSSP_PAD} * GSSP_RECORD,
+               "empty leaf payload does not match its page count");
+        for (std::size_t i = GSSP_HEADER; i < bytes.size(); ++i)
+        {
+            const auto expected = semantic && (i - GSSP_HEADER) % GSSP_RECORD == 26 ? 255 : 0;
+            EXPECT(bytes[i] == expected, "empty leaf padding contains visible or misclassified records");
+        }
+        const auto leaf = read_leaf(path);
+        EXPECT(leaf.count == 0 && leaf.records.empty(), "padding was read as real Gaussian points");
+        EXPECT(leaf.semantic == semantic, "empty leaf semantic padding was not preserved");
+    }
+    // Preserve the normal nonempty writer/reader contract at a page boundary.
+    std::vector<std::uint8_t> records((GSSP_PAD + 1) * GSSP_RECORD);
+    for (std::uint32_t i = 0; i < GSSP_PAD + 1; ++i)
+        encode_water_record(records.data() + std::size_t{i} * GSSP_RECORD,
+                            Vec3{140.0, 0.0, -19.0}, Vec3{0.2, 0.2, 0.0005},
+                            {0.2, 0.3, 0.4}, 0.9, true, 1);
+    const auto path = root / "water.bin";
+    write_leaf(path, records, GSSP_PAD + 1, box, true);
+    const auto leaf = read_leaf(path);
+    EXPECT(leaf.padded == 2 * GSSP_PAD && leaf.count == GSSP_PAD + 1 && leaf.records == records,
+           "nonempty water records changed across page padding");
+    std::filesystem::remove_all(root);
+    std::printf("LOD empty leaves: loadable transparent page, semantic padding and real-count round trip passed\n");
+}
+
+void test_parallel_lod_index()
+{
+    using namespace ai3d::waterpost;
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("waterpost-index-" + std::to_string(process_id()));
+    Json children = Json::array();
+    for (int b = 0; b < 64; ++b)
+    {
+        Json leaves = Json::array();
+        for (int i = 0; i < 2; ++i)
+        {
+            leaves.push_back({{"content", {{"uri", "../L22/Node_" + std::to_string(b) +
+                                              "/leaf_" + std::to_string(i) + ".bin"}}},
+                              {"boundingVolume", {{"box", Json::array({b, i, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1})}}}});
+        }
+        if (b == 0)
+            leaves.push_back({{"content", {{"uri", "../L20/Node_0/coarse.bin"}}},
+                              {"boundingVolume", {{"box", Json::array({0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2})}}}});
+        const std::string uri = "manifests/block_" + std::to_string(b) + ".json";
+        write_json_atomic(root / uri, {{"root", {{"children", leaves}}}}, false);
+        children.push_back({{"content", {{"uri", uri}}}});
+    }
+    // Two branches reference the same external manifest. Parallel traversal
+    // must still visit it once and retain deterministic finest-leaf ordering.
+    children.push_back(children[0]);
+    write_json_atomic(root / "tileset.json", {{"root", {{"children", children}}}}, false);
+    auto describe = [](const LodIndex& index) {
+        Json result = Json::array();
+        for (const LodBlock& block : index.blocks)
+        {
+            Json leaves = Json::array();
+            for (const LodLeaf& leaf : block.leaves)
+                leaves.push_back({{"uri", leaf.uri}, {"level", leaf.level},
+                                  {"minimum", leaf.box.minimum}, {"maximum", leaf.box.maximum}});
+            result.push_back({{"name", block.name}, {"level", block.level}, {"leaves", leaves}});
+        }
+        return result;
+    };
+    const int previous_threads = thread_count();
+    set_thread_count(1);
+    const auto serial = read_lod_index(root);
+    set_thread_count(8);
+    const auto parallel = read_lod_index(root);
+    EXPECT(describe(serial) == describe(parallel), "serial and parallel LOD indices differ");
+    EXPECT(parallel.blocks.size() == 64, "wrong block count after parallel traversal");
+    for (const auto& block : parallel.blocks)
+        EXPECT(block.level == 22 && block.leaves.size() == 2, "duplicate or coarse leaves in %s", block.name.c_str());
+    enable_lod_index_snapshot_cache();
+    const auto snapshot = describe(read_lod_index(root));
+    const auto first = root / "manifests/block_0.json", hidden = root / "saved.json";
+    std::filesystem::rename(first, hidden);
+    EXPECT(describe(read_lod_index(root)) == snapshot, "cached snapshot unexpectedly reread input");
+    enable_lod_index_snapshot_cache();
+    bool rejected = false;
+    try { read_lod_index(root); }
+    catch (const std::exception&) { rejected = true; }
+    EXPECT(rejected, "cleared snapshot did not reread its missing manifest");
+    std::filesystem::rename(hidden, first);
+    enable_lod_index_snapshot_cache();
+    EXPECT(describe(read_lod_index(root)) == snapshot, "refreshed index differs");
+    set_thread_count(previous_threads);
+    std::filesystem::remove_all(root);
+    std::printf("LOD index: serial/parallel equivalence, shared references, finest levels and snapshot reset passed\n");
+}
+
 int main()
 {
+    test_copy_contents();
+    test_concurrent_json();
     test_float_to_half();
     test_posix_paths();
     test_npz_round_trip();
     test_shore_level();
     test_geo();
     test_undistort();
+    test_empty_lod_leaf();
+    test_parallel_lod_index();
     if (g_failures)
     {
         std::printf("%d check(s) FAILED\n", g_failures);

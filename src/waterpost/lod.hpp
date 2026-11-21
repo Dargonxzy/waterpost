@@ -51,6 +51,10 @@ struct LodIndex
 
 LodIndex read_lod_index(const std::filesystem::path& root);
 
+// CLI inputs remain immutable for a process lifetime. Reuse their parsed index
+// across blocks; calling this again clears the previous snapshots.
+void enable_lod_index_snapshot_cache();
+
 // 根节点的 transform（列主序 4x4，本地 -> ECEF）；没有时返回 false。
 bool read_lod_root_transform(const std::filesystem::path& root, std::array<double, 16>& transform);
 
@@ -65,7 +69,10 @@ struct LeafContent
 
 LeafContent read_leaf(const std::filesystem::path& path);
 
-// 写一个 bin：记录数补齐到 4096，文件头写 box。
+// BIN 记录数按 4096 补齐；空叶也保留一页透明补齐记录，供查看器完成 REPLACE 细化。
+std::uint32_t padded_leaf_count(std::uint32_t count);
+
+// 写一个 bin：记录数补齐到 4096（最少一页），文件头写 box。
 void write_leaf(const std::filesystem::path& path, const std::vector<std::uint8_t>& records, std::uint32_t count,
                 const Box3& box, bool semantic);
 

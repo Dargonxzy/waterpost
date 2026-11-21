@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <atomic>
 #include <regex>
 #include <cctype>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 
@@ -21,6 +23,15 @@ namespace ai3d::waterpost
 {
 namespace
 {
+
+struct LodIndexCache
+{
+    std::mutex mutex;
+    bool enabled = false;
+    std::map<std::string, LodIndex> indices;
+};
+
+LodIndexCache g_index_cache;
 
 bool ends_with(const std::string& text, const std::string& suffix)
 {
@@ -298,7 +309,7 @@ bool read_lod_root_transform(const std::filesystem::path& root, std::array<doubl
     return false;
 }
 
-LodIndex read_lod_index(const std::filesystem::path& root)
+static LodIndex read_lod_index_uncached(const std::filesystem::path& root)
 {
     LodIndex index;
     index.root = root;
@@ -319,6 +330,8 @@ LodIndex read_lod_index(const std::filesystem::path& root)
 
     std::map<std::string, LodBlock> blocks;
     std::set<std::string> visited;
+    std::mutex index_mutex;
+    std::atomic<std::size_t> manifests_read{0};
     std::function<void(const Json&, const std::string&)> walk = [&](const Json& node, const std::string& base) {
         const bool has_children = node.contains("children") && node["children"].is_array() && !node["children"].empty();
         if (node.contains("content") && node["content"].contains("uri"))
@@ -326,9 +339,20 @@ LodIndex read_lod_index(const std::filesystem::path& root)
             const std::string resolved = resolve_uri(base, node["content"]["uri"].get<std::string>());
             if (ends_with(resolved, ".json"))
             {
-                if (visited.insert(resolved).second)
+                bool first;
+                {
+                    std::lock_guard<std::mutex> lock(index_mutex);
+                    first = visited.insert(resolved).second;
+                }
+                if (first)
                 {
                     const Json sub = read_json_file(root / utf8_path(resolved));
+                    const auto count = ++manifests_read;
+                    if (count % 5000 == 0)
+                    {
+                        std::printf("[LOD] read %zu external manifests\n", count);
+                        std::fflush(stdout);
+                    }
                     walk(sub.at("root"), dirname_posix(resolved));
                 }
             }
@@ -341,6 +365,7 @@ LodIndex read_lod_index(const std::filesystem::path& root)
                     leaf.uri = resolved;
                     leaf.level = level_of(node, parts);
                     leaf.box = box_from_json(node);
+                    std::lock_guard<std::mutex> lock(index_mutex);
                     LodBlock& block = blocks[parts[parts.size() - 2]];
                     block.name = parts[parts.size() - 2];
                     block.leaves.push_back(std::move(leaf));
@@ -353,10 +378,8 @@ LodIndex read_lod_index(const std::filesystem::path& root)
         }
         if (has_children)
         {
-            for (const Json& child : node["children"])
-            {
-                walk(child, base);
-            }
+            const Json& children = node["children"];
+            parallel_for_each(children.size(), [&](std::size_t i) { walk(children[i], base); });
         }
     };
     walk(entry.at("root"), "");
@@ -397,6 +420,32 @@ LodIndex read_lod_index(const std::filesystem::path& root)
     return index;
 }
 
+void enable_lod_index_snapshot_cache()
+{
+    std::lock_guard<std::mutex> lock(g_index_cache.mutex);
+    g_index_cache.indices.clear();
+    g_index_cache.enabled = true;
+}
+
+LodIndex read_lod_index(const std::filesystem::path& root)
+{
+    std::unique_lock<std::mutex> lock(g_index_cache.mutex);
+    if (!g_index_cache.enabled)
+    {
+        lock.unlock();
+        return read_lod_index_uncached(root);
+    }
+    const std::string key = path_utf8(std::filesystem::absolute(root).lexically_normal());
+    const auto cached = g_index_cache.indices.find(key);
+    if (cached != g_index_cache.indices.end())
+    {
+        return cached->second;
+    }
+    LodIndex index = read_lod_index_uncached(root);
+    g_index_cache.indices.emplace(key, index);
+    return index;
+}
+
 LeafContent read_leaf(const std::filesystem::path& path)
 {
     const std::vector<std::uint8_t> bytes = read_file_bytes(path);
@@ -426,14 +475,23 @@ LeafContent read_leaf(const std::filesystem::path& path)
     return leaf;
 }
 
+std::uint32_t padded_leaf_count(std::uint32_t count)
+{
+    // A zero-page GSplat content has no _gsplatData in ai3d-studio. Its
+    // REPLACE parent then remains the cover and suppresses ready siblings,
+    // including the new water surface. Transparent padding is already part
+    // of the GSSP format and keeps the real record count at zero on readback.
+    if (count == 0)
+    {
+        return GSSP_PAD;
+    }
+    return count % GSSP_PAD ? count + GSSP_PAD - count % GSSP_PAD : count;
+}
+
 void write_leaf(const std::filesystem::path& path, const std::vector<std::uint8_t>& records, std::uint32_t count,
                 const Box3& box, bool semantic)
 {
-    std::uint32_t padded = count;
-    if (count % GSSP_PAD)
-    {
-        padded = count + GSSP_PAD - count % GSSP_PAD;
-    }
+    const std::uint32_t padded = padded_leaf_count(count);
     std::vector<std::uint8_t> out(GSSP_HEADER + std::size_t{padded} * GSSP_RECORD, 0);
     std::memcpy(out.data(), "gssp", 4);
     std::memcpy(out.data() + 4, &padded, 4);
@@ -442,7 +500,10 @@ void write_leaf(const std::filesystem::path& path, const std::vector<std::uint8_
         put_f32(out.data() + 8 + 4 * k, static_cast<float>(box.minimum[k]));
         put_f32(out.data() + 20 + 4 * k, static_cast<float>(box.maximum[k]));
     }
-    std::memcpy(out.data() + GSSP_HEADER, records.data(), std::size_t{count} * GSSP_RECORD);
+    if (count != 0)
+    {
+        std::memcpy(out.data() + GSSP_HEADER, records.data(), std::size_t{count} * GSSP_RECORD);
+    }
     if (semantic)
     {
         for (std::uint32_t i = count; i < padded; ++i)
@@ -687,8 +748,9 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
             {
                 continue;
             }
-            const std::string key = fs::relative(entry.path(), output).generic_u8string();
-            if (!std::regex_match(key, water_sibling) || by_uri.count(key) || fs::exists(input / fs::relative(entry.path(), output)))
+            const fs::path relative = entry.path().lexically_relative(output);
+            const std::string key = relative.generic_u8string();
+            if (!std::regex_match(key, water_sibling) || by_uri.count(key) || fs::exists(input / relative))
             {
                 continue;
             }
@@ -714,7 +776,9 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
         {
             continue;
         }
-        const fs::path relative = fs::relative(entry.path(), input);
+        // The iterator already supplies a path under input. Avoid resolving
+        // every ancestor through remote FUSE metadata for each file.
+        const fs::path relative = entry.path().lexically_relative(input);
         const std::string key = relative.generic_u8string();
         if (by_uri.count(key))
         {
@@ -742,11 +806,9 @@ void finalize_lod(const std::filesystem::path& input, const std::filesystem::pat
                 return;
             }
         }
-        fs::copy_file(source, target, fs::copy_options::overwrite_existing, error);
-        if (error)
-        {
-            fail_runtime("Copy failed: " + path_utf8(source) + " -> " + path_utf8(target) + ": " + error.message());
-        }
+        // Only bytes are needed here. std::filesystem::copy_file can fail with
+        // EPERM on writable OSS FUSE paths because it also sets file modes.
+        copy_file_contents(source, target);
         fs::last_write_time(target, fs::last_write_time(source, error), error);
     });
     for (const LeafChange& change : changes)

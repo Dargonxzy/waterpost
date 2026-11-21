@@ -9,6 +9,7 @@
 
 #include "error.hpp"
 #include "fs_util.hpp"
+#include "lod.hpp"
 #include "parallel.hpp"
 #include "project.hpp"
 #include "scene.hpp"
@@ -369,6 +370,7 @@ int main(int argc, char** argv)
             fail_value("Unknown mode '" + config.mode + "'; use --mode blocks or --mode poses");
         }
         set_thread_count(config.threads);
+        enable_lod_index_snapshot_cache();
         save_config(config);
         const Timer total;
         auto needs_output = [&]() {

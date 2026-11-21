@@ -1,0 +1,19 @@
+name: ai3d-waterpost-build
+channels:
+  - conda-forge
+dependencies:
+  - gcc_linux-64=13
+  - gxx_linux-64=13
+  - sysroot_linux-64=2.28
+  - cmake=3.31
+  - ninja
+  - libopencv=4.10.*=headless*
+  - eigen=3.4
+  - nlohmann_json
+  - tbb-devel
+  - zlib
+  - zstd
+  - spdlog
+  - cryptopp
+  - cpp-expected
+  - patchelf

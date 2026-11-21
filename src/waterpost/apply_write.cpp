@@ -1634,7 +1634,6 @@ void run_write(const Config& config, const std::string& name)
         capacity = std::max(capacity, read_leaf_padded(lod.root / utf8_path(leaf.uri)));
     }
     std::vector<std::vector<Json>> change_items(touched.size());
-    auto padded_of = [](std::uint32_t count) { return count % GSSP_PAD ? count + GSSP_PAD - count % GSSP_PAD : count; };
     auto box_json6 = [](const Box3& box) {
         return Json{box.minimum[0], box.minimum[1], box.minimum[2], box.maximum[0], box.maximum[1], box.maximum[2]};
     };
@@ -1676,7 +1675,7 @@ void run_write(const Config& config, const std::string& name)
         Json item;
         item["uri"] = leaf.uri;
         item["count"] = count;
-        item["padded"] = padded_of(count);
+        item["padded"] = padded_leaf_count(count);
         item["removed"] = removed_per_leaf[l].size();
         item["added"] = next;
         item["box"] = box_json6(box);
@@ -1705,7 +1704,7 @@ void run_write(const Config& config, const std::string& name)
             sibling["uri"] = uri;
             sibling["sibling_of"] = leaf.uri;
             sibling["count"] = extra_count;
-            sibling["padded"] = padded_of(extra_count);
+            sibling["padded"] = padded_leaf_count(extra_count);
             sibling["removed"] = 0;
             sibling["added"] = extra_count;
             sibling["box"] = box_json6(extra_box);
