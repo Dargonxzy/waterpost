@@ -9,6 +9,7 @@
 
 #include "error.hpp"
 #include "fs_util.hpp"
+#include "json_util.hpp"
 #include "lod.hpp"
 #include "parallel.hpp"
 #include "project.hpp"
@@ -66,6 +67,7 @@ const char* HELP =
     "       ai3d_waterpost evaluate (--project DIR | (--poses FILE | --cameras FILE --images FILE) --mask-dir DIR)\n"
     "                               [--photos DIR] [--image-root PREFIX] [--pose-crs auto|none|EPSG:326NN] --out CSV\n"
     "                               --variant name=LOD [--variant ...] [--step N] [--views a.jpg,b.jpg] [--gpu-id N]\n"
+    "                               [--regions floaters.json ...] [--region-out CSV] [--region-pad PX]\n"
     "stages: all split assign scene detect reconcile candidates active samples model write finalize\n"
     "  --mode blocks|poses  blocks: cameras/blocks from <project>/artifacts/blocks; poses: LOD + --poses JSON\n"
     "  --project DIR        task directory (artifacts/blocks, bbox.json); required in blocks mode\n"
@@ -89,8 +91,12 @@ const char* HELP =
     "  --no-water-carve --carve-erosion-cells N --carve-surface-tolerance X --carve-above-band X\n"
     "  --carve-max-depth X --carve-below-margin X --carve-below-reach X --carve-float-band X\n"
     "  --carve-float-visible-water X --carve-bank-visible-water X --carve-float-max X --carve-float-geometry-water X\n"
+    "  --carve-edge-band 0|1  also clear water-level points with water evidence in the footprint rim outside the interior\n"
     "  --denoise 0|1 --denoise-method sor|radius|cluster --denoise-k N --denoise-std-ratio X\n"
-    "  --denoise-max-distance X --denoise-radius X --denoise-min-neighbors N --denoise-min-points N\n";
+    "  --denoise-max-distance X --denoise-radius X --denoise-min-neighbors N --denoise-min-points N\n"
+    "  --floater-check 0|1|2 --floater-max-points N --floater-gap X --floater-clearance X --floater-elongation X\n"
+    "  --floater-photos DIR --floater-photo-views N --floater-photo-gain DB  photo check of medium clusters (check 1)\n"
+    "  --water-edge-sigma K  limit generated water to K sigma inside the accepted footprint (0 = off, report only)\n";
 
 } // namespace
 
@@ -116,6 +122,9 @@ int main(int argc, char** argv)
             int step = 10, gpu = 0, water_class = 9;
             std::vector<std::pair<std::string, std::filesystem::path>> variants;
             std::vector<std::string> only;
+            std::vector<EvalRegion> regions;
+            std::filesystem::path region_csv;
+            int region_pad = 6;
             for (std::size_t i = 1; i + 1 < args.size(); i += 2)
             {
                 const std::string& key = args[i];
@@ -137,6 +146,30 @@ int main(int argc, char** argv)
                 else if (key == "--step") step = std::stoi(value);
                 else if (key == "--gpu-id") gpu = std::stoi(value);
                 else if (key == "--water-class") water_class = std::stoi(value);
+                else if (key == "--region-out") region_csv = utf8_path(value);
+                else if (key == "--region-pad") region_pad = std::stoi(value);
+                else if (key == "--regions")
+                {
+                    // write 输出的 floaters.json（candidates），或 {"regions": [{"id", "low", "high", ...}]}。
+                    const Json doc = read_json_file(utf8_path(value));
+                    const std::string block = doc.value("block", std::string());
+                    const Json& list = doc.contains("candidates") ? doc.at("candidates") : doc.at("regions");
+                    for (const Json& item : list)
+                    {
+                        EvalRegion region;
+                        region.block = item.value("block", block);
+                        region.id = item.contains("component") ? std::to_string(item.at("component").get<long long>())
+                                                               : item.at("id").get<std::string>();
+                        region.decision = item.value("decision", std::string());
+                        region.points = item.value("points", std::size_t{0});
+                        for (int a = 0; a < 3; ++a)
+                        {
+                            region.low[static_cast<std::size_t>(a)] = item.at("low")[static_cast<std::size_t>(a)].get<double>();
+                            region.high[static_cast<std::size_t>(a)] = item.at("high")[static_cast<std::size_t>(a)].get<double>();
+                        }
+                        regions.push_back(region);
+                    }
+                }
                 else if (key == "--views")
                 {
                     std::size_t start = 0;
@@ -173,7 +206,8 @@ int main(int argc, char** argv)
                 pose_config.mask_dir = masks;
                 pose_config.lod = variants.front().second; // 坐标换算与检查用第一个 LOD 的地理参考
             }
-            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only, posed ? &pose_config : nullptr);
+            run_evaluate(project, variants, masks, images, step, csv, gpu, water_class, only, posed ? &pose_config : nullptr,
+                         regions, region_csv, region_pad);
             return 0;
         }
         catch (const std::exception& error)
@@ -231,6 +265,7 @@ int main(int argc, char** argv)
             else if (key == "--link-output") link = true;
             else if (key == "--denoise-method") overrides.emplace_back("denoise_method:" + value(), "0");
             else if (key == "--no-water-carve") overrides.emplace_back("water_carve", "0");
+            else if (key == "--floater-photos") overrides.emplace_back("floater_photos:" + value(), "0");
             else if (key.rfind("--", 0) == 0)
             {
                 std::string name = key.substr(2);
@@ -337,6 +372,11 @@ int main(int argc, char** argv)
                 config.denoise_method = name.substr(15);
                 continue;
             }
+            if (name.rfind("floater_photos:", 0) == 0)
+            {
+                config.floater_photos = std::filesystem::absolute(utf8_path(name.substr(15)));
+                continue;
+            }
             const double v = std::stod(text);
             if (name == "water_class") config.water_class = static_cast<int>(v);
             else if (name == "cell_size") config.cell_size = v;
@@ -354,6 +394,7 @@ int main(int argc, char** argv)
             else if (name == "carve_bank_visible_water") config.carve_bank_visible_water = v;
             else if (name == "carve_float_max") config.carve_float_max = v;
             else if (name == "carve_float_geometry_water") config.carve_float_geometry_water = v;
+            else if (name == "carve_edge_band") config.carve_edge_band = v != 0;
             else if (name == "denoise") config.denoise = v != 0;
             else if (name == "denoise_radius") config.denoise_radius = v;
             else if (name == "denoise_min_points") config.denoise_min_points = static_cast<int>(v);
@@ -361,6 +402,14 @@ int main(int argc, char** argv)
             else if (name == "denoise_std_ratio") config.denoise_std_ratio = v;
             else if (name == "denoise_max_distance") config.denoise_max_distance = v;
             else if (name == "denoise_min_neighbors") config.denoise_min_neighbors = static_cast<int>(v);
+            else if (name == "floater_check") config.floater_check = static_cast<int>(v);
+            else if (name == "floater_max_points") config.floater_max_points = static_cast<int>(v);
+            else if (name == "floater_gap") config.floater_gap = v;
+            else if (name == "floater_clearance") config.floater_clearance = v;
+            else if (name == "floater_elongation") config.floater_elongation = v;
+            else if (name == "floater_photo_views") config.floater_photo_views = static_cast<int>(v);
+            else if (name == "floater_photo_gain") config.floater_photo_gain = v;
+            else if (name == "water_edge_sigma") config.water_edge_sigma = v;
             else if (name == "view_margin") config.view_margin = v;
             else if (name == "min_view_leaves") config.min_view_leaves = static_cast<int>(v);
             else fail_value("Unknown option --" + name);

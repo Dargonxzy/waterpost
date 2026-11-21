@@ -1,5 +1,6 @@
 // 纯函数单元测试：半精度转换、POSIX 路径工具、npz 读写往返。失败时返回非 0。
 
+#include "floaters.hpp"
 #include "lod.hpp"
 #include "npz.hpp"
 #include "npz_util.hpp"
@@ -543,10 +544,68 @@ void test_parallel_lod_index()
     std::printf("LOD index: serial/parallel equivalence, shared references, finest levels and snapshot reset passed\n");
 }
 
+// 中等连通簇的漂浮物判定：地面上方悬空的密集簇删除；贴近主体、贴着水面、下方没有观测、上方有遮挡、
+// 细长线状、碰到块边界的都不删。
+void test_floater_classification()
+{
+    Gaussians g;
+    std::vector<std::int32_t> component;
+    auto add = [&](double x, double y, double z, std::int32_t c) {
+        g.xyz.insert(g.xyz.end(), {x, y, z});
+        g.opacity.push_back(0.5f);
+        g.semantic.insert(g.semantic.end(), {3, 255});
+        component.push_back(c);
+        ++g.count;
+    };
+    // 0：地面 x∈[-10, 20]、y∈[-10, 10]；水面区域 x∈[20, 30] 没有地面点（水位 0）；x∈[-30, -20] 什么都没有。
+    for (double x = -10; x <= 20; x += 0.3)
+        for (double y = -10; y <= 10; y += 0.3)
+            add(x, y, 0.0, 0);
+    // 1：屋顶 x∈[10, 18]、y∈[-4, 4]、z = 10。
+    for (double x = 10; x <= 18; x += 0.15)
+        for (double y = -4; y <= 4; y += 0.15)
+            add(x, y, 10.0, 1);
+    std::mt19937 random(7);
+    std::uniform_real_distribution<double> jitter(-0.3, 0.3);
+    auto blob = [&](double x, double y, double z, std::int32_t c) {
+        for (int k = 0; k < 50; ++k)
+            add(x + jitter(random), y + jitter(random), z + jitter(random), c);
+    };
+    blob(0, 0, 6, 2);          // 悬空：删除
+    blob(-5, 5, 1.0, 3);       // 离地 0.7 m：贴近主体
+    blob(25, 0, 0.4, 4);       // 水面上的小船：下方是水面
+    blob(-25, 0, 6, 5);        // 下方没有任何观测
+    blob(14, 0, 6, 6);         // 屋顶下方
+    for (int k = 0; k < 50; ++k) add(-4 + 0.12 * k, -6, 6 + 0.01 * jitter(random), 7); // 6 m 长的线
+    blob(5, -5, 6, 8);         // 同样悬空，但标记为碰到块边界
+    std::vector<std::size_t> sizes(9, 0);
+    for (std::int32_t c : component) ++sizes[static_cast<std::size_t>(c)];
+    std::vector<std::uint8_t> border(9, 0);
+    border[8] = 1;
+    FloaterParams params;
+    const auto water = [](double x0, double, double x1, double) {
+        return (x1 >= 20 && x0 <= 30) ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+    };
+    const std::vector<FloaterCandidate> result = classify_floaters(g, component, sizes, border, params, water);
+    EXPECT(result.size() == 7, "candidates %zu", result.size());
+    const char* expected[9] = {"", "", "remove_suspended_floater", "keep_near_structure", "review_detached_supported",
+                               "review_unobserved_below", "review_detached_covered", "review_elongated", "keep_block_border"};
+    for (const FloaterCandidate& f : result)
+    {
+        EXPECT(f.decision == expected[f.component], "component %d: %s (gap %.2f clearance %.2f)", f.component, f.decision.c_str(),
+               f.gap, f.clearance);
+        EXPECT(f.points == 50, "component %d has %zu points", f.component, f.points);
+    }
+    // 点数阈值不再是免检条件：把 max_points 降到 40，50 点的簇都成了主体，不再判定。
+    params.max_points = 40;
+    EXPECT(classify_floaters(g, component, sizes, border, params, water).empty(), "max_points");
+}
+
 int main()
 {
     test_copy_contents();
     test_concurrent_json();
+    test_floater_classification();
     test_float_to_half();
     test_posix_paths();
     test_npz_round_trip();

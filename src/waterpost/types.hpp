@@ -119,6 +119,9 @@ struct Config
     double carve_bank_visible_water = 0.3;
     double carve_float_max = 15.0;
     double carve_float_geometry_water = 0.2;
+    // 岸边带：腐蚀内部区之外、但仍在已接受足迹内、处于水位附近（-below_margin ~ +surface_tolerance）、有岸边渲染水证据、
+    // 不属于可靠陆地的原始点。原规则里 below 要求内部区、deep 要求低于水位 below_margin，这一带没有任何分支能删。
+    bool carve_edge_band = false;
 
     // 通用漂浮物去噪：中心距离 <= denoise_radius 的高斯连成簇，少于 denoise_min_points 的小簇删除。
     // 方法：cluster（欧氏聚类小簇，默认）、sor（统计离群点）、radius（半径离群点）。
@@ -130,6 +133,22 @@ struct Config
     double denoise_radius = 0.5;        // radius / cluster：半径
     int denoise_min_neighbors = 5;      // radius：半径内最少邻居
     int denoise_min_points = 30;        // cluster：最小簇点数
+
+    // cluster 的第二步（floaters.hpp）：点数 >= denoise_min_points 的中等簇按主体距离与下方支撑判定。
+    // 判定结果总是写进 write/<块>/floaters.json。floater_check：0 只报告；1 删除 remove_* 的簇；
+    // 2 仅供实验：删除全部非块边界的中等簇（与 1 的结果对照，用照片检验每个簇）。
+    int floater_check = 0;
+    int floater_max_points = 2000;      // 大于它的簇视为主体
+    double floater_gap = 1.5;           // 到主体最近距离 >= 它才算分离（m）
+    double floater_clearance = 1.5;     // 簇底到下方主体表面 / 水面 >= 它才算悬空（m）
+    double floater_elongation = 8.0;    // 线状结构（电线等）只标记待核查
+    // floater_check = 1 时的照片核验：只有照片支持删除的簇才删除（几何判定只决定"怎么标记"）。
+    std::filesystem::path floater_photos; // 训练照片目录；空 = <project>/.temp/undistortion/images
+    int floater_photo_views = 24;       // 每个簇最多用的视图数
+    double floater_photo_gain = 0.1;    // 去掉后投影区域 PSNR 至少变化这么多 dB 才下结论
+
+    // 新水面高斯的岸线约束：水平方向 k sigma 不越过已接受水体足迹的边界（0 = 关闭，只统计越界）。
+    double water_edge_sigma = 0.0;
 };
 
 } // namespace ai3d::waterpost

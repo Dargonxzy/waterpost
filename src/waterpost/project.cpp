@@ -454,6 +454,7 @@ Json config_to_json(const Config& c)
     v["carve_bank_visible_water"] = c.carve_bank_visible_water;
     v["carve_float_max"] = c.carve_float_max;
     v["carve_float_geometry_water"] = c.carve_float_geometry_water;
+    v["carve_edge_band"] = c.carve_edge_band;
     v["denoise"] = c.denoise;
     v["denoise_method"] = c.denoise_method;
     v["denoise_k"] = c.denoise_k;
@@ -462,6 +463,15 @@ Json config_to_json(const Config& c)
     v["denoise_min_neighbors"] = c.denoise_min_neighbors;
     v["denoise_radius"] = c.denoise_radius;
     v["denoise_min_points"] = c.denoise_min_points;
+    v["floater_check"] = c.floater_check;
+    v["floater_max_points"] = c.floater_max_points;
+    v["floater_gap"] = c.floater_gap;
+    v["floater_clearance"] = c.floater_clearance;
+    v["floater_elongation"] = c.floater_elongation;
+    v["floater_photos"] = path_utf8(c.floater_photos);
+    v["floater_photo_views"] = c.floater_photo_views;
+    v["floater_photo_gain"] = c.floater_photo_gain;
+    v["water_edge_sigma"] = c.water_edge_sigma;
     return v;
 }
 
@@ -500,6 +510,7 @@ Config config_from_json(const Json& v)
     c.carve_bank_visible_water = jnum(v.at("carve_bank_visible_water"));
     c.carve_float_max = jnum(v.at("carve_float_max"));
     c.carve_float_geometry_water = jnum(v.at("carve_float_geometry_water"));
+    c.carve_edge_band = v.value("carve_edge_band", false);
     c.denoise = v.value("denoise", true);
     c.denoise_radius = v.contains("denoise_radius") ? jnum(v.at("denoise_radius")) : 0.5;
     c.denoise_min_points = v.value("denoise_min_points", 30);
@@ -508,6 +519,15 @@ Config config_from_json(const Json& v)
     c.denoise_std_ratio = v.contains("denoise_std_ratio") ? jnum(v.at("denoise_std_ratio")) : 2.0;
     c.denoise_max_distance = v.contains("denoise_max_distance") ? jnum(v.at("denoise_max_distance")) : 2.0;
     c.denoise_min_neighbors = v.value("denoise_min_neighbors", 5);
+    c.floater_check = v.contains("floater_check") ? (v.at("floater_check").is_boolean() ? (v.at("floater_check").get<bool>() ? 1 : 0) : v.at("floater_check").get<int>()) : 0;
+    c.floater_max_points = v.value("floater_max_points", 2000);
+    c.floater_gap = v.contains("floater_gap") ? jnum(v.at("floater_gap")) : 1.5;
+    c.floater_clearance = v.contains("floater_clearance") ? jnum(v.at("floater_clearance")) : 1.5;
+    c.floater_elongation = v.contains("floater_elongation") ? jnum(v.at("floater_elongation")) : 8.0;
+    c.floater_photos = utf8_path(v.value("floater_photos", std::string()));
+    c.floater_photo_views = v.value("floater_photo_views", 24);
+    c.floater_photo_gain = v.contains("floater_photo_gain") ? jnum(v.at("floater_photo_gain")) : 0.1;
+    c.water_edge_sigma = v.contains("water_edge_sigma") ? jnum(v.at("water_edge_sigma")) : 0.0;
     return c;
 }
 

@@ -120,6 +120,17 @@ write 阶段对每块最细层的剩余高斯做一次连通簇去噪：中心�
 点数少于 `--denoise-min-points`（默认 30）的小簇删除；碰到块瓦片边界（2 倍半径内）的簇可能连着邻块，保留。
 `--denoise 0` 关闭；`--denoise-method sor|radius` 可改用统计离群点 / 半径离群点滤波（默认 `cluster`）。稀疏但与主体相连的高斯（树冠边缘等）属于大簇，不受影响。
 
+点数达到阈值的中等簇（30 ～ `--floater-max-points`，默认 2000）另做判定，结果写进 `work\apply\write\<块>\floaters.json`：
+几何上看到主体的距离、下方支撑 / 水面的离空高度、上方遮挡与细长度；`--floater-check 1` 时再用训练照片核验
+（`--floater-photos`，默认 `<project>\.temp\undistortion\images`）：在看得到该簇的视图里渲染含 / 不含它的块（带上邻块作背景），
+只在它的投影区域与照片比较。只有"照片支持删除、且几何上与主体分离"的簇才删除，其余标记为 keep_* / review_*。
+默认 `--floater-check 0` 只报告，输出不变。实验与参数说明见 [doc/chishui-floaters-water-adhesion-experiments-20261122.md](doc/chishui-floaters-water-adhesion-experiments-20261122.md)。
+
+write 的 `record.json` 另有：`water_residual`（带水证据却未删除的原始点按原因汇总，`--debug` 时写 `water_residual.npz`）、
+`water_edge`（新水面 2σ 越出已接受足迹的统计）。`--water-edge-sigma K` 把新水面水平 K sigma 收在足迹内（建议 2）；
+`--carve-edge-band 1` 额外清理岸边带原始点（实验表明会在新水面与岸之间留缝，默认关闭）。`evaluate --regions` 按区域与照片比较，
+并输出岸线带（掩码边界 15 px 内）的 PSNR。
+
 ## 当前限制
 
 - 相机只支持 PINHOLE / SIMPLE_PINHOLE（有畸变的模型需要先去畸变）；

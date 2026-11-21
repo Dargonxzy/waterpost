@@ -3,6 +3,7 @@
 
 #include "apply_common.hpp"
 #include "error.hpp"
+#include "floaters.hpp"
 #include "fs_util.hpp"
 #include "lod.hpp"
 #include "npz_util.hpp"
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <set>
@@ -480,8 +482,19 @@ Samples load_samples(const Config& config, const std::string& block)
 // 漂浮物去噪：剩余高斯按"中心距离 <= denoise_radius"连成簇（并查集），点数少于 denoise_min_points 的小簇
 // 视为漂浮物删除。与逐点密度阈值不同，树冠边缘等稀疏但与主体相连的高斯属于大簇，不受影响。
 // 碰到块瓦片边界（距离 < 2 * radius）的簇可能连着邻块，保留。
+using WaterLevel = std::function<double(double, double, double, double)>;
+
+// 去噪的附带输出：中等簇的判定明细（floaters.json），以及每个剩余高斯所在连通簇的点数（残留水点诊断用）。
+struct DenoiseExtras
+{
+    WaterLevel water_level;
+    const Gaussians* context = nullptr;        // 照片核验渲染时带上的邻块最细层高斯
+    std::vector<FloaterCandidate> candidates;
+    std::vector<std::uint32_t> component_size; // n；已删除的点为 0
+};
+
 std::vector<std::int64_t> denoise_cluster(const Gaussians& g, const std::vector<std::int64_t>& removed, const LodBlock& block,
-                                          const Config& config, Json& stats)
+                                          const Config& config, Json& stats, DenoiseExtras& extras)
 {
     const Timer timer;
     const std::size_t n = g.count;
@@ -633,6 +646,139 @@ std::vector<std::int64_t> denoise_cluster(const Gaussians& g, const std::vector<
     {
         clusters += (count < static_cast<std::size_t>(config.denoise_min_points) && !border.count(root)) ? 1 : 0;
     }
+    // 第二步：中等簇（>= min_points）按主体距离与下方支撑判定（floaters.hpp）。总是计算并记录；
+    // 只有 floater_check 打开时才删除 remove_* 的簇。
+    std::vector<std::int32_t> component(n, -1);
+    std::vector<std::size_t> sizes;
+    std::vector<std::uint8_t> touches;
+    {
+        std::unordered_map<std::uint32_t, std::int32_t> dense;
+        for (std::size_t v = 0; v < voxels; ++v)
+        {
+            const std::uint32_t root = find(static_cast<std::uint32_t>(v));
+            const auto [it, inserted] = dense.emplace(root, static_cast<std::int32_t>(sizes.size()));
+            if (inserted)
+            {
+                sizes.push_back(size[root]);
+                touches.push_back(border.count(root) ? 1 : 0);
+            }
+            for (std::size_t p = voxel_start[v]; p < voxel_start[v + 1]; ++p)
+            {
+                component[keys[p].second] = it->second;
+            }
+        }
+    }
+    extras.component_size.assign(n, 0);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        if (component[i] >= 0)
+        {
+            extras.component_size[i] = static_cast<std::uint32_t>(sizes[static_cast<std::size_t>(component[i])]);
+        }
+    }
+    FloaterParams params;
+    params.min_points = static_cast<std::size_t>(std::max(1, config.denoise_min_points));
+    params.max_points = static_cast<std::size_t>(std::max(config.floater_max_points, config.denoise_min_points));
+    params.gap = config.floater_gap;
+    params.clearance = config.floater_clearance;
+    params.elongation = config.floater_elongation;
+    params.column_pad = radius;
+    const Timer floater_timer;
+    extras.candidates = classify_floaters(g, component, sizes, touches, params, extras.water_level);
+    Json photo_stats;
+    if (config.floater_check == 1)
+    {
+        // 照片核验：非块边界的中等簇都核验（几何上"贴近主体"的簇也可能是贴着树冠的漂浮物）。
+        FloaterPhotoParams photo;
+        photo.photos = !config.floater_photos.empty() ? config.floater_photos
+                       : config.project.empty()       ? std::filesystem::path()
+                                                      : config.project / ".temp" / "undistortion" / "images";
+        photo.max_views = static_cast<std::size_t>(std::max(1, config.floater_photo_views));
+        photo.min_gain = config.floater_photo_gain;
+        photo.gpu = config.gpu;
+        std::vector<std::uint8_t> check(extras.candidates.size(), 0);
+        for (std::size_t k = 0; k < check.size(); ++k)
+        {
+            check[k] = extras.candidates[k].border ? 0 : 1;
+        }
+        std::vector<View> views;
+        if (!photo.photos.empty() && std::filesystem::is_directory(photo.photos))
+        {
+            if (const SceneBlock* scene_block = load_scene(config).block(block.name))
+            {
+                views = scene_views(config, scene_block->view_keys);
+            }
+        }
+        std::size_t rendered = 0;
+        double seconds = 0;
+        verify_floaters_with_photos(g, component, extras.candidates, check, views, photo, extras.context, rendered, seconds);
+        std::map<std::string, std::size_t> verdicts;
+        for (FloaterCandidate& f : extras.candidates)
+        {
+            combine_floater_evidence(f);
+            ++verdicts[f.photo];
+        }
+        photo_stats["photos"] = path_utf8(photo.photos);
+        photo_stats["views_available"] = views.size();
+        photo_stats["views_rendered"] = rendered;
+        photo_stats["verdicts"] = verdicts;
+        photo_stats["seconds"] = seconds;
+        photo_stats["context_gaussians"] = extras.context ? extras.context->count : 0;
+        log("[FLOATER] %s: photo check of %zu clusters in %zu views (%.1fs)", block.name.c_str(), extras.candidates.size(),
+            rendered, seconds);
+    }
+    else
+    {
+        for (FloaterCandidate& f : extras.candidates)
+        {
+            f.geometry = f.decision;
+        }
+    }
+    std::map<std::string, std::size_t> decisions, decision_points;
+    std::size_t floater_points = 0;
+    auto drops = [&](const FloaterCandidate& f) {
+        return config.floater_check == 2 ? !f.border : (config.floater_check == 1 && f.remove());
+    };
+    for (const FloaterCandidate& f : extras.candidates)
+    {
+        ++decisions[f.decision];
+        decision_points[f.decision] += f.points;
+        if (drops(f))
+        {
+            floater_points += f.points;
+        }
+    }
+    if (config.floater_check)
+    {
+        std::vector<std::uint8_t> drop(sizes.size(), 0);
+        for (const FloaterCandidate& f : extras.candidates)
+        {
+            drop[static_cast<std::size_t>(f.component)] = drops(f) ? 1 : 0;
+        }
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            if (component[i] >= 0 && drop[static_cast<std::size_t>(component[i])])
+            {
+                floaters.push_back(static_cast<std::int64_t>(i));
+            }
+        }
+    }
+    Json floater_stats;
+    floater_stats["mode"] = config.floater_check;
+    floater_stats["max_points"] = params.max_points;
+    floater_stats["gap"] = params.gap;
+    floater_stats["clearance"] = params.clearance;
+    floater_stats["elongation"] = params.elongation;
+    floater_stats["candidates"] = extras.candidates.size();
+    floater_stats["decisions"] = decisions;
+    floater_stats["decision_points"] = decision_points;
+    floater_stats["removed_points"] = floater_points;
+    floater_stats["seconds"] = floater_timer.seconds();
+    if (!photo_stats.is_null())
+    {
+        floater_stats["photo_check"] = photo_stats;
+    }
+    stats["floater_check"] = floater_stats;
     std::sort(floaters.begin(), floaters.end());
     stats["radius"] = radius;
     stats["min_points"] = config.denoise_min_points;
@@ -641,7 +787,21 @@ std::vector<std::int64_t> denoise_cluster(const Gaussians& g, const std::vector<
     stats["removed_points"] = floaters.size();
     stats["seconds"] = timer.seconds();
     log("[DENOISE] %s: %zu floater points in %zu small clusters (of %zu components), %.1fs", block.name.c_str(),
-        floaters.size(), clusters, size.size(), timer.seconds());
+        floaters.size() - floater_points, clusters, size.size(), timer.seconds());
+    std::size_t remove_clusters = 0, remove_points = 0, review_clusters = 0;
+    for (const auto& [decision, count] : decisions)
+    {
+        if (decision.rfind("remove_", 0) == 0)
+        {
+            remove_clusters += count;
+            remove_points += decision_points[decision];
+        }
+        review_clusters += decision.rfind("review_", 0) == 0 ? count : 0;
+    }
+    log("[FLOATER] %s: %zu medium clusters checked, %zu to remove (%zu points) %s, %zu for review", block.name.c_str(),
+        extras.candidates.size(), remove_clusters, remove_points,
+        config.floater_check == 1 ? "removed" : config.floater_check == 2 ? "(all candidates dropped: experiment)" : "reported only",
+        review_clusters);
     return floaters;
 }
 
@@ -814,12 +974,12 @@ std::vector<std::int64_t> denoise_filter(const Gaussians& g, const std::vector<s
 }
 
 std::vector<std::int64_t> denoise_floaters(const Gaussians& g, const std::vector<std::int64_t>& removed, const LodBlock& block,
-                                           const Config& config, Json& stats)
+                                           const Config& config, Json& stats, DenoiseExtras& extras)
 {
     if (config.denoise_method == "cluster")
     {
         stats["method"] = "cluster";
-        return denoise_cluster(g, removed, block, config, stats);
+        return denoise_cluster(g, removed, block, config, stats, extras);
     }
     if (config.denoise_method == "sor" || config.denoise_method == "radius")
     {
@@ -1206,9 +1366,115 @@ void run_write(const Config& config, const std::string& name)
         }
     }
 
+    // ---------------- 足迹格网窗口：体积清理、漂浮簇下方水位、新水面岸线约束共用。
+    // label：0 无水，-2 工程格网之外，>0 已接受水体的足迹（所有相邻块的 samples 合起来）。
+    std::int64_t low[2] = {0, 0}, size[2] = {0, 0};
+    cv::Mat label;
+    if (!accepted.empty() && n)
+    {
+        // 窗口：本块点的 XY 范围 + 腐蚀与可达余量。
+        double xlo[2] = {1e300, 1e300}, xhi[2] = {-1e300, -1e300};
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            for (int a = 0; a < 2; ++a)
+            {
+                xlo[a] = std::min(xlo[a], g.xyz[3 * i + a]);
+                xhi[a] = std::max(xhi[a], g.xyz[3 * i + a]);
+            }
+        }
+        const int reach_cells = static_cast<int>(std::ceil(config.carve_below_reach / spacing));
+        const int margin = std::max(config.carve_erosion_cells, reach_cells) + 2;
+        for (int a = 0; a < 2; ++a)
+        {
+            low[a] = static_cast<std::int64_t>(std::floor((xlo[a] - grid.origin[a]) / spacing)) - margin;
+            size[a] = static_cast<std::int64_t>(std::ceil((xhi[a] - grid.origin[a]) / spacing)) + margin + 1 - low[a];
+        }
+        if (size[0] * size[1] > 400000000LL)
+        {
+            fail_value("Water carve window is too large");
+        }
+        label = cv::Mat(static_cast<int>(size[0]), static_cast<int>(size[1]), CV_32S, cv::Scalar(0));
+        for (int x = 0; x < label.rows; ++x)
+        {
+            const std::int64_t gx = low[0] + x;
+            for (int y = 0; y < label.cols; ++y)
+            {
+                const std::int64_t gy = low[1] + y;
+                if (gx < 0 || gx >= grid.shape[0] || gy < 0 || gy >= grid.shape[1])
+                {
+                    label.at<int>(x, y) = -2;
+                }
+            }
+        }
+        for (const BlockRecord& other : report.blocks)
+        {
+            // 足迹格在所属块的范围内（± 一格）：范围与清理窗口不相交的块跳过，不读它的 samples。
+            bool overlaps = true;
+            for (int a = 0; a < 2; ++a)
+            {
+                const std::int64_t first = static_cast<std::int64_t>(std::floor((other.bounds.minimum[a] - spacing - grid.origin[a]) / spacing)) - 1;
+                const std::int64_t last = static_cast<std::int64_t>(std::ceil((other.bounds.maximum[a] + spacing - grid.origin[a]) / spacing)) + 1;
+                overlaps &= last >= low[a] && first < low[a] + size[a];
+            }
+            if (!overlaps)
+            {
+                continue;
+            }
+            const Samples& s = samples_of(other.name);
+            for (std::size_t k = 0; k < s.footprint_ids.size(); ++k)
+            {
+                const std::int64_t lx = s.footprint_cells[2 * k] - low[0], ly = s.footprint_cells[2 * k + 1] - low[1];
+                if (accepted.count(s.footprint_ids[k]) && lx >= 0 && ly >= 0 && lx < size[0] && ly < size[1])
+                {
+                    label.at<int>(static_cast<int>(lx), static_cast<int>(ly)) = s.footprint_ids[k];
+                }
+            }
+        }
+    }
+    auto footprint_at = [&](double x, double y) -> int {
+        if (label.empty())
+        {
+            return 0;
+        }
+        const std::int64_t cx = static_cast<std::int64_t>(std::nearbyint((x - grid.origin[0]) / spacing)) - low[0];
+        const std::int64_t cy = static_cast<std::int64_t>(std::nearbyint((y - grid.origin[1]) / spacing)) - low[1];
+        if (cx < 0 || cy < 0 || cx >= size[0] || cy >= size[1])
+        {
+            return 0;
+        }
+        return label.at<int>(static_cast<int>(cx), static_cast<int>(cy));
+    };
+
     // ---------------- 体积清理
     Json carve_stats;
     std::vector<std::int64_t> carved;
+    // 残留水点诊断（问题 B）：带水证据（语义为水，或可见渲染 / 几何水份额达到阈值）却既未被投票删除、也未被体积清理
+    // 选中的原始点，记下第一条没满足的条件。只诊断，不改变删除结果。
+    static const char* const RESIDUAL_REASONS[] = {
+        "guarded_on_land",          // 已被选中，又被"渲染非水占优"保护撤销
+        "shore_protected",          // 已被选中，又被岸线锚点保护撤销（不在腐蚀内部区）
+        "no_water_in_reach",        // 可达距离内没有已接受水体
+        "below_too_deep",           // 低于水位超过 carve_max_depth
+        "bank_without_evidence",    // 岸下深处，但既不在足迹内也没有岸边渲染水证据
+        "near_level_outside_interior", // 水位附近、在腐蚀内部区之外（岸边带）
+        "above_band_land",          // 内部区水面上方 above_band 内，但属于可靠陆地格网
+        "above_not_in_footprint",   // 水面上方，不在任何足迹格内
+        "above_low_visible",        // 水面上方、在足迹内，但可见水份额低于 carve_float_visible_water
+        "above_too_high",           // 水面上方、有可见水证据，但超出 float_band / float_max
+        "other"};
+    constexpr int RESIDUAL_REASON_COUNT = static_cast<int>(sizeof(RESIDUAL_REASONS) / sizeof(RESIDUAL_REASONS[0]));
+    std::vector<std::int64_t> residual;
+    std::vector<std::uint8_t> residual_reason, residual_semantic;
+    bool has_semantic = lod.semantic;
+    for (std::size_t i = 0; i < n && !has_semantic; ++i)
+    {
+        has_semantic = g.semantic[2 * i] != 0 || g.semantic[2 * i + 1] != 0;
+    }
+    std::vector<std::uint8_t> voted_flag(n, 0);
+    for (std::int64_t r : voted)
+    {
+        voted_flag[static_cast<std::size_t>(r)] = 1;
+    }
     const std::filesystem::path dir = detect_dir(config, name);
     if (config.water_carve && !accepted.empty() && n)
     {
@@ -1257,65 +1523,6 @@ void run_write(const Config& config, const std::string& name)
                 on_land[i] = share[i] != 255 && share[i] < 127;
             }
             has_visible = true;
-        }
-        // 窗口：本块点的 XY 范围 + 腐蚀与可达余量。
-        double xlo[2] = {1e300, 1e300}, xhi[2] = {-1e300, -1e300};
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            for (int a = 0; a < 2; ++a)
-            {
-                xlo[a] = std::min(xlo[a], g.xyz[3 * i + a]);
-                xhi[a] = std::max(xhi[a], g.xyz[3 * i + a]);
-            }
-        }
-        const int reach_cells = static_cast<int>(std::ceil(config.carve_below_reach / spacing));
-        const int margin = std::max(config.carve_erosion_cells, reach_cells) + 2;
-        std::int64_t low[2], size[2];
-        for (int a = 0; a < 2; ++a)
-        {
-            low[a] = static_cast<std::int64_t>(std::floor((xlo[a] - grid.origin[a]) / spacing)) - margin;
-            size[a] = static_cast<std::int64_t>(std::ceil((xhi[a] - grid.origin[a]) / spacing)) + margin + 1 - low[a];
-        }
-        if (size[0] * size[1] > 400000000LL)
-        {
-            fail_value("Water carve window is too large");
-        }
-        cv::Mat label(static_cast<int>(size[0]), static_cast<int>(size[1]), CV_32S, cv::Scalar(0));
-        for (int x = 0; x < label.rows; ++x)
-        {
-            const std::int64_t gx = low[0] + x;
-            for (int y = 0; y < label.cols; ++y)
-            {
-                const std::int64_t gy = low[1] + y;
-                if (gx < 0 || gx >= grid.shape[0] || gy < 0 || gy >= grid.shape[1])
-                {
-                    label.at<int>(x, y) = -2;
-                }
-            }
-        }
-        for (const BlockRecord& other : report.blocks)
-        {
-            // 足迹格在所属块的范围内（± 一格）：范围与清理窗口不相交的块跳过，不读它的 samples。
-            bool overlaps = true;
-            for (int a = 0; a < 2; ++a)
-            {
-                const std::int64_t first = static_cast<std::int64_t>(std::floor((other.bounds.minimum[a] - spacing - grid.origin[a]) / spacing)) - 1;
-                const std::int64_t last = static_cast<std::int64_t>(std::ceil((other.bounds.maximum[a] + spacing - grid.origin[a]) / spacing)) + 1;
-                overlaps &= last >= low[a] && first < low[a] + size[a];
-            }
-            if (!overlaps)
-            {
-                continue;
-            }
-            const Samples& s = samples_of(other.name);
-            for (std::size_t k = 0; k < s.footprint_ids.size(); ++k)
-            {
-                const std::int64_t lx = s.footprint_cells[2 * k] - low[0], ly = s.footprint_cells[2 * k + 1] - low[1];
-                if (accepted.count(s.footprint_ids[k]) && lx >= 0 && ly >= 0 && lx < size[0] && ly < size[1])
-                {
-                    label.at<int>(static_cast<int>(lx), static_cast<int>(ly)) = s.footprint_ids[k];
-                }
-            }
         }
         cv::Mat carve(label.size(), CV_32S, cv::Scalar(0));
         std::set<int> present;
@@ -1374,7 +1581,7 @@ void run_write(const Config& config, const std::string& name)
         {
             protect[static_cast<std::size_t>(r)] = 1;
         }
-        std::size_t c_below = 0, c_deep = 0, c_floating = 0, c_above = 0, guarded = 0, interior = 0;
+        std::size_t c_below = 0, c_deep = 0, c_floating = 0, c_above = 0, c_edge = 0, guarded = 0, interior = 0;
         for (std::size_t i = 0; i < n; ++i)
         {
             const double* p = g.point(i);
@@ -1400,15 +1607,44 @@ void run_write(const Config& config, const std::string& name)
                 floating = (rendered && reach_dz <= config.carve_float_band) ||
                            (rendered && whole_on_water[i] && reach_dz <= config.carve_float_max);
             }
-            bool selected = below || above || floating;
+            const bool edge_band = config.carve_edge_band && !inside && reach > 0 && in_footprint && bank_rendered[i] &&
+                                   reach_dz >= -config.carve_below_margin && reach_dz <= config.carve_surface_tolerance &&
+                                   !(has_land && land[i]);
+            bool selected = below || above || floating || edge_band;
+            bool was_guarded = false, was_shore = false;
             if (selected && has_visible && on_land[i])
             {
                 ++guarded;
                 selected = false;
+                was_guarded = true;
             }
             if (selected && protect[i] && !inside)
             {
                 selected = false;
+                was_shore = true;
+            }
+            if (!selected && !voted_flag[i])
+            {
+                const bool semantic_water = has_semantic && g.semantic[2 * i] == config.water_class;
+                const bool evidence = bank_rendered[i] || float_rendered[i] || whole_on_water[i];
+                if (semantic_water || evidence)
+                {
+                    const double tol = config.carve_surface_tolerance;
+                    int why = RESIDUAL_REASON_COUNT - 1;
+                    if (was_guarded) why = 0;
+                    else if (was_shore) why = 1;
+                    else if (!inside && reach <= 0) why = 2;
+                    else if ((inside && dz < -config.carve_max_depth) || (reach > 0 && reach_dz < -config.carve_max_depth)) why = 3;
+                    else if (!inside && reach_dz < -config.carve_below_margin && !bank_ok) why = 4;
+                    else if (!inside && reach_dz >= -config.carve_below_margin && reach_dz <= tol) why = 5;
+                    else if (inside && dz > tol && dz <= config.carve_above_band) why = 6;
+                    else if (reach_dz > tol && !in_footprint) why = 7;
+                    else if (reach_dz > tol && !float_rendered[i]) why = 8;
+                    else if (reach_dz > tol) why = 9;
+                    residual.push_back(static_cast<std::int64_t>(i));
+                    residual_reason.push_back(static_cast<std::uint8_t>(why));
+                    residual_semantic.push_back(semantic_water ? 1 : 0);
+                }
             }
             if (selected)
             {
@@ -1417,6 +1653,7 @@ void run_write(const Config& config, const std::string& name)
                 c_deep += deep && !inside;
                 c_floating += floating && !(below || above);
                 c_above += above;
+                c_edge += edge_band && !(below || above || floating);
             }
         }
         carve_stats["carved"] = carved.size();
@@ -1424,6 +1661,7 @@ void run_write(const Config& config, const std::string& name)
         carve_stats["deep_rim_or_bank"] = c_deep;
         carve_stats["floating"] = c_floating;
         carve_stats["above"] = c_above;
+        carve_stats["edge_band"] = c_edge;
         carve_stats["rendered_land_guarded"] = guarded;
         carve_stats["interior_footprint_points"] = interior;
     }
@@ -1433,9 +1671,66 @@ void run_write(const Config& config, const std::string& name)
 
     // ---------------- 通用漂浮物去噪（与水无关，整块最细层）
     Json denoise_stats;
+    DenoiseExtras extras;
+    // 簇下方的水位：XY 范围内任一已接受足迹格的最高水位。
+    extras.water_level = [&](double x0, double y0, double x1, double y1) {
+        double level = std::numeric_limits<double>::quiet_NaN();
+        if (label.empty())
+        {
+            return level;
+        }
+        for (double x = x0; x <= x1 + spacing / 2; x += spacing / 2)
+        {
+            for (double y = y0; y <= y1 + spacing / 2; y += spacing / 2)
+            {
+                const int wid = footprint_at(std::min(x, x1), std::min(y, y1));
+                if (wid > 0)
+                {
+                    const double h = accepted.at(wid).first;
+                    level = std::isnan(level) ? h : std::max(level, h);
+                }
+            }
+        }
+        return level;
+    };
+    // 照片核验的渲染背景：XY 范围与本块相距 50 m 以内的其他块的最细层高斯（只读一次，只在 floater_check = 1 时）。
+    Gaussians context;
+    if (config.denoise && n && config.floater_check == 1 && config.denoise_method == "cluster")
+    {
+        Box3 own;
+        for (const LodLeaf& leaf : block->leaves)
+        {
+            own.expand(leaf.box);
+        }
+        for (const LodBlock& other : lod.blocks)
+        {
+            if (other.name == name)
+            {
+                continue;
+            }
+            Box3 box;
+            for (const LodLeaf& leaf : other.leaves)
+            {
+                box.expand(leaf.box);
+            }
+            const double dx = std::max({own.minimum[0] - box.maximum[0], box.minimum[0] - own.maximum[0], 0.0});
+            const double dy = std::max({own.minimum[1] - box.maximum[1], box.minimum[1] - own.maximum[1], 0.0});
+            if (!box.valid() || std::hypot(dx, dy) > 50.0)
+            {
+                continue;
+            }
+            const Gaussians h = read_block_gaussians(lod, other, nullptr);
+            context.count += h.count;
+            context.xyz.insert(context.xyz.end(), h.xyz.begin(), h.xyz.end());
+            context.cov.insert(context.cov.end(), h.cov.begin(), h.cov.end());
+            context.opacity.insert(context.opacity.end(), h.opacity.begin(), h.opacity.end());
+            context.rgba.insert(context.rgba.end(), h.rgba.begin(), h.rgba.end());
+        }
+        extras.context = &context;
+    }
     if (config.denoise && n)
     {
-        const std::vector<std::int64_t> floaters = denoise_floaters(g, removed, *block, config, denoise_stats);
+        const std::vector<std::int64_t> floaters = denoise_floaters(g, removed, *block, config, denoise_stats, extras);
         std::vector<std::int64_t> merged;
         std::set_union(removed.begin(), removed.end(), floaters.begin(), floaters.end(), std::back_inserter(merged));
         removed = std::move(merged);
@@ -1443,6 +1738,52 @@ void run_write(const Config& config, const std::string& name)
 
     // ---------------- 新水面高斯（同一水体全局 k<=4 近邻定尺度）
     const Json& index = model.at("plan_index");
+    // 新水面岸线诊断（问题 C）：沿 X / Y 到已接受足迹边界的距离 e，与 2 sigma 比较；water_edge_sigma = k > 0 时
+    // 把该轴尺度收紧到 max(e / k, 5 cm)。e 从中心所在格沿轴向走到最后一个足迹格的外沿，最多走 4 sigma。
+    auto edge_distance = [&](double x, double y, int axis, double limit) -> double {
+        const double inf = std::numeric_limits<double>::infinity();
+        if (label.empty())
+        {
+            return inf;
+        }
+        const double centre = axis == 0 ? x : y;
+        std::int64_t c[2] = {static_cast<std::int64_t>(std::nearbyint((x - grid.origin[0]) / spacing)) - low[0],
+                             static_cast<std::int64_t>(std::nearbyint((y - grid.origin[1]) / spacing)) - low[1]};
+        auto inside = [&](std::int64_t a, std::int64_t b) {
+            return a >= 0 && b >= 0 && a < size[0] && b < size[1] && label.at<int>(static_cast<int>(a), static_cast<int>(b)) > 0;
+        };
+        if (!inside(c[0], c[1]))
+        {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const std::int64_t steps = static_cast<std::int64_t>(std::ceil(limit / spacing)) + 1;
+        double best = inf;
+        for (int direction : {-1, 1})
+        {
+            std::int64_t at[2] = {c[0], c[1]};
+            std::int64_t k = 0;
+            for (; k < steps; ++k)
+            {
+                std::int64_t next[2] = {at[0], at[1]};
+                next[axis] += direction;
+                if (!inside(next[0], next[1]))
+                {
+                    break;
+                }
+                at[0] = next[0];
+                at[1] = next[1];
+            }
+            if (k < steps)
+            {
+                const double boundary = grid.origin[axis] + (static_cast<double>(low[axis] + at[axis]) + 0.5 * direction) * spacing;
+                best = std::min(best, std::abs(boundary - centre));
+            }
+        }
+        return best;
+    };
+    std::size_t edge_unknown = 0, edge_limited = 0, edge_clamped = 0, overflow_before = 0, overflow_after = 0;
+    double overflow_before_sum = 0, overflow_after_sum = 0, overflow_before_max = 0, overflow_after_max = 0;
+    constexpr double OVERFLOW_TOLERANCE = 0.2; // 2 sigma 越过足迹边界超过 0.2 m 才计入
     std::vector<Vec3> new_position, new_scale;
     std::vector<std::array<double, 3>> new_rgb;
     std::size_t reference_shards_read = 0, reference_shards_total = 0;
@@ -1531,6 +1872,7 @@ void run_write(const Config& config, const std::string& name)
         reference_shards_total += shards.size();
         const PlaneIndex plane(reference, cell);
         std::vector<Vec3> scales(rows.size());
+        std::vector<double> edge(2 * rows.size()), before(2 * rows.size());
         parallel_ranges(rows.size(), 4096, [&](std::size_t begin, std::size_t end) {
             for (std::size_t q = begin; q < end; ++q)
             {
@@ -1569,9 +1911,56 @@ void run_write(const Config& config, const std::string& name)
                     fail_value("Water height outside project bbox");
                 }
                 s[2] = std::min(s[2], zcap);
+                for (int a = 0; a < 2; ++a)
+                {
+                    const double e = edge_distance(x, y, a, 4 * s[a]);
+                    edge[2 * q + a] = e;
+                    before[2 * q + a] = s[a];
+                    if (config.water_edge_sigma > 0 && std::isfinite(e))
+                    {
+                        s[a] = std::min(s[a], std::max(e / config.water_edge_sigma, 0.05));
+                    }
+                }
                 scales[q] = s;
             }
         });
+        for (std::size_t q = 0; q < rows.size(); ++q)
+        {
+            bool unknown = false, limited = false, clamped = false;
+            double worst_before = -1e300, worst_after = -1e300;
+            for (int a = 0; a < 2; ++a)
+            {
+                const double e = edge[2 * q + a];
+                if (std::isnan(e))
+                {
+                    unknown = true;
+                    continue;
+                }
+                if (!std::isfinite(e))
+                {
+                    continue;
+                }
+                limited = true;
+                clamped |= scales[q][static_cast<std::size_t>(a)] < before[2 * q + a];
+                worst_before = std::max(worst_before, 2 * before[2 * q + a] - e);
+                worst_after = std::max(worst_after, 2 * scales[q][static_cast<std::size_t>(a)] - e);
+            }
+            edge_unknown += unknown;
+            edge_limited += limited;
+            edge_clamped += clamped;
+            if (worst_before > OVERFLOW_TOLERANCE)
+            {
+                ++overflow_before;
+                overflow_before_sum += worst_before;
+                overflow_before_max = std::max(overflow_before_max, worst_before);
+            }
+            if (worst_after > OVERFLOW_TOLERANCE)
+            {
+                ++overflow_after;
+                overflow_after_sum += worst_after;
+                overflow_after_max = std::max(overflow_after_max, worst_after);
+            }
+        }
         for (std::size_t q = 0; q < rows.size(); ++q)
         {
             const std::size_t k = rows[q];
@@ -1734,6 +2123,125 @@ void run_write(const Config& config, const std::string& name)
         npz_put(writer, "carved_indices", carved);
         writer.write(out / "applied.npz", true);
     }
+    // 漂浮簇判定明细。
+    {
+        Json list = Json::array();
+        for (const FloaterCandidate& f : extras.candidates)
+        {
+            auto num = [](double v) { return std::isfinite(v) ? Json(v) : Json(nullptr); };
+            Json item;
+            item["component"] = f.component;
+            item["points"] = f.points;
+            item["decision"] = f.decision;
+            item["geometry"] = f.geometry;
+            item["photo"] = f.photo;
+            item["photo_views"] = f.photo_views;
+            item["photo_differ_views"] = f.photo_differ;
+            item["photo_drop_wins"] = f.photo_wins;
+            item["photo_keep_psnr"] = num(f.photo_keep_psnr);
+            item["photo_drop_psnr"] = num(f.photo_drop_psnr);
+            item["centroid"] = Json{f.centroid[0], f.centroid[1], f.centroid[2]};
+            item["low"] = Json{f.low[0], f.low[1], f.low[2]};
+            item["high"] = Json{f.high[0], f.high[1], f.high[2]};
+            item["gap"] = num(f.gap);
+            item["clearance"] = num(f.clearance);
+            item["support_top"] = num(f.support_top);
+            item["water_level"] = num(f.water_level);
+            item["covered"] = f.covered;
+            item["spacing"] = f.spacing;
+            item["elongation"] = f.elongation;
+            item["length"] = f.length;
+            item["mean_opacity"] = f.mean_opacity;
+            item["semantic"] = f.semantic;
+            list.push_back(item);
+        }
+        Json doc;
+        doc["block"] = name;
+        doc["mode"] = config.floater_check;
+        doc["candidates"] = list;
+        write_json_atomic(out / "floaters.json", doc, false);
+    }
+    // 残留水点按原因汇总；同时看它们最后落在多大的连通簇里（>= floater_max_points 视为与主体粘连）。
+    Json residual_stats;
+    {
+        std::vector<std::uint8_t> gone(n, 0);
+        for (std::int64_t r : removed)
+        {
+            gone[static_cast<std::size_t>(r)] = 1;
+        }
+        Json reasons = Json::object();
+        std::size_t total = 0, total_semantic = 0, total_attached = 0, total_denoised = 0;
+        std::vector<std::uint32_t> residual_component(residual.size(), 0);
+        for (int why = 0; why < RESIDUAL_REASON_COUNT; ++why)
+        {
+            std::size_t count = 0, semantic = 0, attached = 0, denoised = 0;
+            for (std::size_t k = 0; k < residual.size(); ++k)
+            {
+                if (residual_reason[k] != why)
+                {
+                    continue;
+                }
+                const std::size_t i = static_cast<std::size_t>(residual[k]);
+                const std::uint32_t component = extras.component_size.empty() ? 0 : extras.component_size[i];
+                residual_component[k] = component;
+                ++count;
+                semantic += residual_semantic[k];
+                if (gone[i])
+                {
+                    ++denoised;
+                }
+                else if (component > static_cast<std::uint32_t>(config.floater_max_points))
+                {
+                    ++attached;
+                }
+            }
+            if (count)
+            {
+                reasons[RESIDUAL_REASONS[why]] = Json{{"points", count}, {"semantic_water", semantic},
+                                                      {"attached_to_large_component", attached}, {"removed_by_denoise", denoised}};
+            }
+            total += count;
+            total_semantic += semantic;
+            total_attached += attached;
+            total_denoised += denoised;
+        }
+        residual_stats["points"] = total;
+        residual_stats["semantic_water"] = total_semantic;
+        residual_stats["attached_to_large_component"] = total_attached;
+        residual_stats["removed_by_denoise"] = total_denoised;
+        residual_stats["semantic_available"] = has_semantic;
+        residual_stats["by_reason"] = reasons;
+        if (config.debug)
+        {
+            NpzWriter writer;
+            std::vector<double> position(3 * residual.size());
+            for (std::size_t k = 0; k < residual.size(); ++k)
+            {
+                for (int a = 0; a < 3; ++a)
+                {
+                    position[3 * k + static_cast<std::size_t>(a)] = g.xyz[3 * static_cast<std::size_t>(residual[k]) + static_cast<std::size_t>(a)];
+                }
+            }
+            npz_put(writer, "indices", residual);
+            npz_put(writer, "reason", residual_reason);
+            npz_put(writer, "semantic_water", residual_semantic);
+            npz_put(writer, "component_size", residual_component);
+            npz_put(writer, "xyz", position);
+            writer.write(out / "water_residual.npz", true);
+        }
+    }
+    Json edge_stats;
+    edge_stats["sigma_limit"] = config.water_edge_sigma;
+    edge_stats["generated"] = new_position.size();
+    edge_stats["centre_outside_footprint"] = edge_unknown;
+    edge_stats["near_edge"] = edge_limited;
+    edge_stats["clamped"] = edge_clamped;
+    edge_stats["overflow_2sigma_before"] = overflow_before;
+    edge_stats["overflow_2sigma_before_mean"] = overflow_before ? overflow_before_sum / static_cast<double>(overflow_before) : 0.0;
+    edge_stats["overflow_2sigma_before_max"] = overflow_before_max;
+    edge_stats["overflow_2sigma_after"] = overflow_after;
+    edge_stats["overflow_2sigma_after_mean"] = overflow_after ? overflow_after_sum / static_cast<double>(overflow_after) : 0.0;
+    edge_stats["overflow_2sigma_after_max"] = overflow_after_max;
     Json record;
     record["block"] = name;
     record["count"] = n;
@@ -1743,6 +2251,8 @@ void run_write(const Config& config, const std::string& name)
     record["changed_leaves"] = touched.size();
     record["water_carve"] = carve_stats;
     record["denoise"] = denoise_stats;
+    record["water_residual"] = residual_stats;
+    record["water_edge"] = edge_stats;
     record["changes"] = changes;
     record["reference_shards_read"] = reference_shards_read;
     record["reference_shards_total"] = reference_shards_total;

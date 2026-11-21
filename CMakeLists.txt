@@ -68,6 +68,8 @@ add_library(ai3d_waterpost_lib STATIC
     src/waterpost/camera.cpp
     src/waterpost/detect.cpp
     src/waterpost/evaluate.cpp
+    src/waterpost/floater_photos.cpp
+    src/waterpost/floaters.cpp
     src/waterpost/fs_util.cpp
     src/waterpost/geo.cpp
     src/waterpost/json_util.cpp
